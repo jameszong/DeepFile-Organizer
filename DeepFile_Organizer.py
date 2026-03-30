@@ -5545,7 +5545,7 @@ class FileToolApp:
                 self.root.after(0, lambda: self.tab6_status_var.set("转换为PDF中..."))
                 self.root.after(0, lambda: self.log("开始转换为PDF..."))
                 
-                # 使用 win32com + 扩展名欺骗进行 PDF 转换（优化版）
+                # 使用 win32com + 扩展名欺骗进行 PDF 转换（自我修复版）
                 import tempfile
                 
                 pdf_errors = []
@@ -5563,18 +5563,12 @@ class FileToolApp:
                     temp_dir = tempfile.mkdtemp(prefix="pdf_obfuscate_")
                     
                     self.root.after(0, lambda: self.log("使用 Word + 扩展名欺骗进行 PDF 转换（绕过 DLP）..."))
-                    self.root.after(0, lambda: self.log("进程复用模式 - 提升效率 500%"))
+                    self.root.after(0, lambda: self.log("自我修复模式 - 动态进程管理"))
                     
                     # 初始化 COM（只初始化一次）
                     pythoncom.CoInitialize()
                     
-                    # 启动 Word 进程（使用 DispatchEx 强制独立后台进程）
-                    word_app = win32com.client.DispatchEx("Word.Application")
-                    word_app.Visible = False
-                    word_app.ScreenUpdating = False
-                    word_app.DisplayAlerts = 0
-                    
-                    # 批量转换 - 复用同一个 Word 进程
+                    # 批量转换 - 动态进程管理
                     for i, docx_file in enumerate(word_files):
                         if self.tab6_stop_flag:
                             break
@@ -5605,17 +5599,29 @@ class FileToolApp:
                             try:
                                 start_time = time.time()
                                 
-                                # 打开文档（只读和隐藏模式）
+                                # 健康检查：如果 word_app 为 None，重新创建
+                                if word_app is None:
+                                    word_app = win32com.client.DispatchEx("Word.Application")
+                                    word_app.Visible = False
+                                    word_app.DisplayAlerts = 0
+                                
+                                # 打开文档
                                 doc = word_app.Documents.Open(docx_path, ReadOnly=True, Visible=False)
                                 
-                                # 使用 SaveAs2 导出为 PDF（更快）
-                                doc.SaveAs2(temp_obfuscated_path, FileFormat=17)
+                                # 使用 ExportAsFixedFormat（更稳定）
+                                doc.ExportAsFixedFormat(
+                                    OutputFileName=temp_obfuscated_path,
+                                    ExportFormat=17,  # wdExportFormatPDF
+                                    OpenAfterExport=False,
+                                    OptimizeFor=0,  # wdExportOptimizeForPrint
+                                    CreateBookmarks=1  # wdExportCreateHeadingBookmarks
+                                )
                                 
-                                # 关闭文档（不保存更改）
+                                # 关闭文档
                                 doc.Close(0)  # wdDoNotSaveChanges
                                 
-                                # 等待文件生成
-                                time.sleep(0.2)
+                                # COM 缓冲时间
+                                time.sleep(0.5)
                                 
                                 # 检查文件是否存在
                                 if os.path.exists(temp_obfuscated_path) and os.path.getsize(temp_obfuscated_path) > 0:
@@ -5635,20 +5641,27 @@ class FileToolApp:
                                     raise Exception("PDF文件未生成")
                                     
                             except Exception as e:
-                                # 确保关闭文档
-                                if doc:
-                                    try:
+                                # 进程重置机制：销毁当前进程
+                                try:
+                                    if doc:
                                         doc.Close(0)
-                                    except:
-                                        pass
-                                    doc = None
+                                except:
+                                    pass
+                                doc = None
+                                
+                                try:
+                                    if word_app:
+                                        word_app.Quit()
+                                except:
+                                    pass
+                                word_app = None  # 重要：标记为需要重新创建
                                 
                                 if retry == max_retries - 1:
                                     pdf_errors.append(f"{docx_file}: {str(e)}")
                                     pdf_error_msg = f"  × PDF转换失败 {docx_file}: {e}"
                                     self.root.after(0, lambda msg=pdf_error_msg: self.log(msg))
                                 else:
-                                    self.root.after(0, lambda msg=f"  重试 {docx_file} (第{retry + 1}次)...": self.log(msg))
+                                    self.root.after(0, lambda msg=f"  重试 {docx_file} (第{retry + 1}次，已重置进程)...": self.log(msg))
                                     time.sleep(1)
                         
                         # 更新进度
