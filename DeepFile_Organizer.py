@@ -5547,6 +5547,9 @@ class FileToolApp:
                 
                 # 使用 win32com + 扩展名欺骗进行 PDF 转换
                 import tempfile
+                import threading
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                
                 pdf_errors = []
                 
                 # 获取所有 Word 文件
@@ -5560,113 +5563,153 @@ class FileToolApp:
                 temp_dir = tempfile.mkdtemp(prefix="pdf_obfuscate_")
                 
                 self.root.after(0, lambda: self.log("使用 Word + 扩展名欺骗进行 PDF 转换（绕过 DLP）..."))
+                self.root.after(0, lambda: self.log(f"使用 2 个并行进程加速转换..."))
                 
-                # 批量转换 - 每个文件使用独立的 Word 进程
-                for i, docx_file in enumerate(word_files):
-                    if self.tab6_stop_flag:
-                        break
+                # 创建锁用于线程同步
+                progress_lock = threading.Lock()
+                stop_event = threading.Event()
+                
+                def convert_batch_with_word_process(batch_files, thread_id):
+                    """使用一个 Word 进程处理一批文件"""
+                    word_app = None
+                    local_completed = 0
                     
-                    docx_path = os.path.join(output_dir, docx_file)
-                    final_pdf_path = os.path.join(pdf_dir, docx_file.replace('.docx', '.pdf'))
-                    temp_obfuscated_path = os.path.join(temp_dir, docx_file.replace('.docx', '.dat'))
-                    
-                    # 如果文件已存在，跳过
-                    if os.path.exists(final_pdf_path):
-                        completed_tasks += 1
-                        progress = completed_tasks / total_tasks * 100
-                        self.root.after(0, lambda p=progress, s=f"PDF转换中... {i + 1}/{len(word_files)}": (
-                            self.tab6_progress_var.set(p),
-                            self.tab6_status_var.set(s)
-                        ))
-                        continue
-                    
-                    # 重试机制
-                    max_retries = 3
-                    success = False
-                    
-                    for retry in range(max_retries):
-                        if self.tab6_stop_flag:
-                            break
-                            
-                        word_app = None
-                        try:
-                            start_time = time.time()
-                            
-                            # 每次转换都重新初始化 COM 和 Word
-                            pythoncom.CoInitialize()
-                            
-                            # 启动新的 Word 进程（使用最基本的方式）
-                            word_app = win32com.client.Dispatch("Word.Application")
-                            word_app.Visible = False
-                            word_app.DisplayAlerts = 0
-                            
-                            # 打开文档
-                            doc = word_app.Documents.Open(docx_path)
-                            
-                            # 使用 SaveAs2 导出为 PDF（更快）
-                            # 17 = wdFormatPDF
-                            doc.SaveAs2(temp_obfuscated_path, FileFormat=17)
-                            
-                            # 关闭文档
-                            doc.Close(False)
-                            
-                            # 等待文件生成
-                            time.sleep(0.5)
-                            
-                            # 检查文件是否存在
-                            if os.path.exists(temp_obfuscated_path) and os.path.getsize(temp_obfuscated_path) > 0:
-                                # 移动并重命名文件
-                                shutil.move(temp_obfuscated_path, final_pdf_path)
-                                
-                                file_size = os.path.getsize(final_pdf_path)
-                                conversion_time = time.time() - start_time
-                                
-                                success_msg = f"PDF转换成功: {docx_file} (耗时: {conversion_time:.2f}s, 大小: {file_size//1024}KB)"
-                                self.root.after(0, lambda msg=success_msg: self.log(msg))
-                                
-                                success = True
-                                completed_tasks += 1
+                    try:
+                        # 初始化 COM（每个线程独立）
+                        pythoncom.CoInitialize()
+                        
+                        # 启动 Word 进程
+                        word_app = win32com.client.Dispatch("Word.Application")
+                        word_app.Visible = False
+                        word_app.DisplayAlerts = 0
+                        
+                        for docx_file in batch_files:
+                            if self.tab6_stop_flag or stop_event.is_set():
                                 break
-                            else:
-                                raise Exception("PDF文件未生成")
-                                
-                        except Exception as e:
-                            if retry == max_retries - 1:
-                                pdf_errors.append(f"{docx_file}: {str(e)}")
-                                pdf_error_msg = f"  × PDF转换失败 {docx_file}: {e}"
-                                self.root.after(0, lambda msg=pdf_error_msg: self.log(msg))
-                            else:
-                                self.root.after(0, lambda msg=f"  重试 {docx_file} (第{retry + 1}次)...": self.log(msg))
-                                time.sleep(2)  # 等待后重试
-                                
-                        finally:
-                            # 确保清理资源
-                            try:
-                                if 'doc' in locals() and doc:
+                            
+                            docx_path = os.path.join(output_dir, docx_file)
+                            final_pdf_path = os.path.join(pdf_dir, docx_file.replace('.docx', '.pdf'))
+                            
+                            # 如果文件已存在，跳过
+                            if os.path.exists(final_pdf_path):
+                                with progress_lock:
+                                    completed_tasks += 1
+                                    local_completed += 1
+                                continue
+                            
+                            temp_obfuscated_path = os.path.join(temp_dir, f"thread_{thread_id}_{docx_file.replace('.docx', '.dat')}")
+                            
+                            # 重试机制
+                            max_retries = 2  # 减少重试次数，因为有进程复用
+                            success = False
+                            
+                            for retry in range(max_retries):
+                                if self.tab6_stop_flag or stop_event.is_set():
+                                    break
+                                    
+                                try:
+                                    start_time = time.time()
+                                    
+                                    # 打开文档
+                                    doc = word_app.Documents.Open(docx_path)
+                                    
+                                    # 使用 SaveAs2 导出为 PDF
+                                    doc.SaveAs2(temp_obfuscated_path, FileFormat=17)
+                                    
+                                    # 关闭文档
                                     doc.Close(False)
-                            except:
-                                pass
+                                    
+                                    # 短暂等待
+                                    time.sleep(0.2)
+                                    
+                                    # 检查文件
+                                    if os.path.exists(temp_obfuscated_path) and os.path.getsize(temp_obfuscated_path) > 0:
+                                        # 移动并重命名
+                                        shutil.move(temp_obfuscated_path, final_pdf_path)
+                                        
+                                        file_size = os.path.getsize(final_pdf_path)
+                                        conversion_time = time.time() - start_time
+                                        
+                                        success_msg = f"PDF转换成功: {docx_file} (耗时: {conversion_time:.2f}s, 大小: {file_size//1024}KB) [线程{thread_id}]"
+                                        self.root.after(0, lambda msg=success_msg: self.log(msg))
+                                        
+                                        with progress_lock:
+                                            completed_tasks += 1
+                                            local_completed += 1
+                                        success = True
+                                        break
+                                    else:
+                                        raise Exception("PDF文件未生成")
+                                        
+                                except Exception as e:
+                                    if retry == max_retries - 1:
+                                        with progress_lock:
+                                            pdf_errors.append(f"{docx_file}: {str(e)}")
+                                        error_msg = f"  × PDF转换失败 {docx_file}: {e}"
+                                        self.root.after(0, lambda msg=error_msg: self.log(msg))
+                                    else:
+                                        self.root.after(0, lambda msg=f"  重试 {docx_file} (线程{thread_id} 第{retry + 1}次)...": self.log(msg))
+                                        time.sleep(1)
+                                
+                                finally:
+                                    # 确保关闭文档
+                                    try:
+                                        if 'doc' in locals() and doc:
+                                            doc.Close(False)
+                                    except:
+                                        pass
                             
-                            try:
-                                if word_app:
-                                    word_app.Quit()
-                            except:
-                                pass
-                            
-                            try:
-                                pythoncom.CoUninitialize()
-                            except:
-                                pass
-                            
-                            # 强制垃圾回收
-                            gc.collect()
+                            # 每处理5个文件后短暂休息
+                            if local_completed % 5 == 0:
+                                time.sleep(0.5)
                     
-                    # 更新进度
-                    progress = completed_tasks / total_tasks * 100
-                    self.root.after(0, lambda p=progress, s=f"PDF转换中... {i + 1}/{len(word_files)}": (
-                        self.tab6_progress_var.set(p),
-                        self.tab6_status_var.set(s)
-                    ))
+                    except Exception as e:
+                        error_msg = f"线程{thread_id}初始化失败: {e}"
+                        self.root.after(0, lambda msg=error_msg: self.log(msg))
+                        stop_event.set()
+                        
+                    finally:
+                        # 清理资源
+                        try:
+                            if word_app:
+                                word_app.Quit()
+                        except:
+                            pass
+                        try:
+                            pythoncom.CoUninitialize()
+                        except:
+                            pass
+                
+                # 分割文件列表为两批
+                mid = len(word_files) // 2
+                batch1 = word_files[:mid]
+                batch2 = word_files[mid:]
+                
+                # 使用线程池并行处理
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(convert_batch_with_word_process, batch1, 1),
+                        executor.submit(convert_batch_with_word_process, batch2, 2)
+                    ]
+                    
+                    # 等待所有任务完成
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            self.root.after(0, lambda msg=f"  × 线程执行错误: {e}": self.log(msg))
+                
+                # 定期更新进度
+                def update_progress():
+                    if not self.tab6_stop_flag:
+                        progress = completed_tasks / total_tasks * 100
+                        self.root.after(0, lambda p=progress: self.tab6_progress_var.set(p))
+                        self.root.after(0, lambda s=f"PDF转换中... {completed_tasks}/{len(word_files)}": self.tab6_status_var.set(s))
+                        
+                        if completed_tasks < len(word_files):
+                            self.root.after(500, update_progress)
+                
+                update_progress()
                 
                 # 清理临时目录
                 try:
