@@ -5600,7 +5600,7 @@ class FileToolApp:
                             word_app.Visible = False
                             word_app.DisplayAlerts = 0
                             word_app.ScreenUpdating = False  # 禁用屏幕更新
-                            word_app.EnableEvents = False     # 禁用事件
+                            # 注意：EnableEvents 在某些 Word 版本中不支持，故移除
                             
                             # 打开文档（使用更多参数提高性能）
                             doc = word_app.Documents.Open(
