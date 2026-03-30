@@ -5615,8 +5615,45 @@ class FileToolApp:
                             # 使用 SaveAs2（更稳定且更快）
                             doc.SaveAs2(temp_obfuscated_path, FileFormat=17)
                             
-                            # 关闭文档
-                            doc.Close(False)
+                            # 等待 Word 完成后台保存（解决竞态条件）
+                            max_wait = 10
+                            wait_time = 0
+                            saved = False
+                            
+                            while wait_time < max_wait:
+                                try:
+                                    # 检查文档是否仍在保存
+                                    if not doc.Saved:  # 如果 Saved 为 False，说明还在保存
+                                        time.sleep(0.5)
+                                        wait_time += 0.5
+                                    else:
+                                        # 文档已保存完成
+                                        saved = True
+                                        break
+                                except:
+                                    # 如果无法访问 Saved 属性，使用文件大小检查
+                                    if os.path.exists(temp_obfuscated_path):
+                                        try:
+                                            size1 = os.path.getsize(temp_obfuscated_path)
+                                            time.sleep(0.5)
+                                            size2 = os.path.getsize(temp_obfuscated_path)
+                                            if size1 > 0 and size1 == size2:
+                                                saved = True
+                                                break
+                                        except:
+                                            pass
+                                    time.sleep(0.5)
+                                    wait_time += 0.5
+                            
+                            # 安全关闭文档
+                            try:
+                                doc.Close(False)
+                            except:
+                                # 如果关闭失败，尝试强制关闭
+                                try:
+                                    word_app.Documents.Close(False)
+                                except:
+                                    pass
                             
                             # 等待文件生成
                             time.sleep(0.3)
