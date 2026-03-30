@@ -35,6 +35,10 @@ jobs:
         pip install -r requirements.txt
         # Install additional dependencies for PDF conversion
         pip install docx2pdf python-docx reportlab psutil
+        # Install compatible NumPy version to avoid PyInstaller issues
+        pip install "numpy<2.0" pandas
+        # Verify NumPy installation
+        python -c "import numpy; print(f'NumPy version: {numpy.__version__}')"
         
     - name: Create PyInstaller spec file
       run: |
@@ -65,7 +69,35 @@ jobs:
                 'reportlab',
                 'reportlab.pdfgen',
                 'reportlab.lib.pagesizes',
-                'reportlab.platypus'
+                'reportlab.platypus',
+                # NumPy and pandas hidden imports
+                'numpy',
+                'numpy._core',
+                'numpy._core._multiarray_umath',
+                'numpy._core._exceptions',
+                'numpy._core.multiarray',
+                'numpy._core.overrides',
+                'numpy.linalg',
+                'numpy.linalg._umath_linalg',
+                'pandas',
+                'pandas._libs',
+                'pandas._libs.tslibs',
+                'pandas._libs.tslibs.base',
+                'pandas._libs.tslibs.dtypes',
+                'pandas._libs.tslibs.conversion',
+                'pandas._libs.tslibs.nattype',
+                'pandas._libs.tslibs.np_datetime',
+                'pandas._libs.tslibs.parsing',
+                'pandas._libs.tslibs.period',
+                'pandas._libs.tslibs.strftime',
+                'pandas._libs.tslibs.timedeltas',
+                'pandas._libs.tslibs.timestamps',
+                'pandas._libs.tslibs.timezones',
+                'pandas._libs.tslibs.tzconversion',
+                'pandas._libs.tslibs.vectorized',
+                'pandas.io',
+                'pandas.io.formats',
+                'pandas.io.formats.format'
             ],
             hookspath = [],
             hooksconfig = {},
