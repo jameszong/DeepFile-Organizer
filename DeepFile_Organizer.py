@@ -5602,11 +5602,9 @@ class FileToolApp:
                             # 打开文档
                             doc = word_app.Documents.Open(docx_path)
                             
-                            # 导出为 PDF，使用欺骗性扩展名（最简单的参数）
-                            doc.ExportAsFixedFormat(
-                                OutputFileName=temp_obfuscated_path,
-                                ExportFormat=17  # wdExportFormatPDF
-                            )
+                            # 使用 SaveAs2 导出为 PDF（更快）
+                            # 17 = wdFormatPDF
+                            doc.SaveAs2(temp_obfuscated_path, FileFormat=17)
                             
                             # 关闭文档
                             doc.Close(False)
