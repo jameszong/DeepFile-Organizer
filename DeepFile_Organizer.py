@@ -5546,7 +5546,6 @@ class FileToolApp:
                 self.root.after(0, lambda: self.log("开始转换为PDF..."))
                 
                 # 使用 win32com + 扩展名欺骗进行 PDF 转换
-                import tempfile
                 pdf_errors = []
                 
                 # 获取所有 Word 文件
@@ -5595,49 +5594,25 @@ class FileToolApp:
                             # 每次转换都重新初始化 COM 和 Word
                             pythoncom.CoInitialize()
                             
-                            # 启动新的 Word 进程（使用 Dispatch 避免 DispatchEx 的窗口闪烁）
+                            # 启动新的 Word 进程（使用最基本的方式）
                             word_app = win32com.client.Dispatch("Word.Application")
                             word_app.Visible = False
                             word_app.DisplayAlerts = 0
-                            word_app.ScreenUpdating = False  # 禁用屏幕更新
-                            # 注意：EnableEvents 在某些 Word 版本中不支持，故移除
                             
-                            # 打开文档（使用更多参数提高性能）
-                            doc = word_app.Documents.Open(
-                                docx_path,
-                                ReadOnly=True,  # 只读模式更快
-                                AddToRecentFiles=False,  # 不添加到最近文档
-                                Visible=False
-                            )
+                            # 打开文档
+                            doc = word_app.Documents.Open(docx_path)
                             
-                            # 导出为 PDF，使用欺骗性扩展名
+                            # 导出为 PDF，使用欺骗性扩展名（最简单的参数）
                             doc.ExportAsFixedFormat(
                                 OutputFileName=temp_obfuscated_path,
-                                ExportFormat=17,  # wdExportFormatPDF
-                                OpenAfterExport=False,
-                                OptimizeFor=1,  # wdExportOptimizeForOnScreen - 更快
-                                Range=0,  # wdExportAllDocument
-                                Item=0,  # wdExportDocumentContent
-                                CreateBookmarks=0,  # wdExportCreateNoBookmarks
-                                DocStructureTags=False,  # 禁用文档结构标签
-                                BitmapMissingFonts=False,  # 禁用位图缺失字体
-                                UseISO19005_1=False,
-                                # 压缩选项
-                                RasterImagesDownsampleTarget=150,  # 降低图片分辨率
-                                RasterImagesDownsampleMinimalResolution=100
+                                ExportFormat=17  # wdExportFormatPDF
                             )
                             
                             # 关闭文档
                             doc.Close(False)
                             
-                            # 等待文件生成（减少等待时间）
-                            max_wait = 5
-                            wait_time = 0
-                            while wait_time < max_wait:
-                                if os.path.exists(temp_obfuscated_path) and os.path.getsize(temp_obfuscated_path) > 0:
-                                    break
-                                time.sleep(0.2)
-                                wait_time += 0.2
+                            # 等待文件生成
+                            time.sleep(0.5)
                             
                             # 检查文件是否存在
                             if os.path.exists(temp_obfuscated_path) and os.path.getsize(temp_obfuscated_path) > 0:
