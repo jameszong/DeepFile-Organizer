@@ -1,0 +1,19 @@
+{
+    "api_key": "your-api-key-here",
+    "model_id": "your-model-id-here",
+    "ocr_mode": "local",
+    "tab4_api_key": "your-tab4-api-key-here",
+    "tab4_model_id": "your-tab4-model-id-here",
+    "tab5_vector_api_key": "your-vector-api-key-here",
+    "tab5_vector_model": "text-embedding-v3",
+    "tab5_ocr_api_key": "your-ocr-api-key-here",
+    "tab5_ocr_model_id": "your-ocr-model-id-here",
+    "tab5_ocr_model": "your-ocr-model-here",
+    "tab5_use_tab4_ocr": true,
+    "tab5_folder_name_col1": "",
+    "tab5_folder_name_col2": "",
+    "tab5_folder_name_col3": "",
+    "tab5_file_name_col1": "",
+    "tab5_file_name_col2": "",
+    "tab5_file_name_col3": ""
+}

@@ -1,0 +1,215 @@
+name: Build Windows EXE with PyInstaller
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: false
+        default: ''
+      create_release:
+        description: 'Create GitHub Release?'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller==6.3.0
+        pip install -r requirements.txt
+        # Install additional dependencies for PDF conversion
+        pip install docx2pdf python-docx reportlab psutil
+        
+    - name: Create PyInstaller spec file
+      run: |
+        cat > DeepFile_Organizer.spec << 'EOF'
+        # -*- mode: python ; coding: utf-8 -*-
+        
+        block_cipher = None
+        
+        a = Analysis(
+            ['DeepFile_Organizer.py'],
+            pathex = [],
+            binaries = [],
+            datas = [],
+            hiddenimports = [
+                'tkinter',
+                'tkinter.ttk',
+                'tkinter.filedialog',
+                'tkinter.messagebox',
+                'tkinter.scrolledtext',
+                'PIL._tkinter_finder',
+                'docx2pdf',
+                'pythoncom',
+                'pywintypes',
+                'win32com',
+                'win32com.client',
+                'comtypes',
+                'psutil',
+                'reportlab',
+                'reportlab.pdfgen',
+                'reportlab.lib.pagesizes',
+                'reportlab.platypus'
+            ],
+            hookspath = [],
+            hooksconfig = {},
+            runtime_hooks = [],
+            excludes = [],
+            win_no_prefer_redirects = False,
+            win_private_assemblies = False,
+            cipher = block_cipher,
+            noarchive = False
+        )
+        
+        pyz = PYZ(a.pure, a.zipped_data, cipher = block_cipher)
+        
+        exe = EXE(
+            pyz,
+            a.scripts,
+            a.binaries,
+            a.zipfiles,
+            a.datas,
+            [],
+            name = 'DeepFile_Organizer',
+            debug = False,
+            bootloader_ignore_signals = False,
+            strip = False,
+            upx = True,
+            upx_exclude = [],
+            runtime_tmpdir = None,
+            console = False,
+            disable_windowed_traceback = False,
+            argv_emulation = False,
+            target_arch = None,
+            codesign_identity = None,
+            entitlements_file = None,
+            version = 'version_info.txt',
+            icon = 'NONE'
+        )
+        EOF
+      shell: bash
+      
+    - name: Create version info for EXE
+      run: |
+        cat > version_info.txt << 'EOF'
+        # UTF-8
+        #
+        # For more details about fixed file info 'ffi' see:
+        # http://msdn.microsoft.com/en-us/library/ms646997.aspx
+        VSVersionInfo(
+          ffi=FixedFileInfo(
+            # filevers and prodvers should be always a tuple with four items: (1, 2, 3, 4)
+            # Set not needed items to zero 0.
+            filevers=(1,0,0,${{ github.run_number }}),
+            prodvers=(1,0,0,${{ github.run_number }}),
+            # Contains a bitmask that specifies the valid bits 'flags'r
+            mask=0x3f,
+            # Contains a bitmask that specifies the Boolean attributes of the file.
+            flags=0x0,
+            # The operating system for which this file was designed.
+            # 0x4 - NT and there is no need to change it.
+            OS=0x4,
+            # The general type of file.
+            # 0x1 - the file is an application.
+            fileType=0x1,
+            # The function of the file.
+            # 0x0 - the function is not defined for this fileType
+            subtype=0x0,
+            # Creation date and time stamp.
+            date=(0, 0)
+            ),
+          kids=[
+            StringFileInfo(
+              [
+              StringTable(
+                u'040904B0',
+                [StringStruct(u'CompanyName', u'DeepFile Organizer'),
+                StringStruct(u'FileDescription', u'智能文件归档管理工具'),
+                StringStruct(u'FileVersion', u'1.0.0.${{ github.run_number }}'),
+                StringStruct(u'InternalName', u'DeepFile_Organizer'),
+                StringStruct(u'LegalCopyright', u'Copyright (C) 2024'),
+                StringStruct(u'OriginalFilename', u'DeepFile_Organizer.exe'),
+                StringStruct(u'ProductName', u'DeepFile Organizer'),
+                StringStruct(u'ProductVersion', u'1.0.0.${{ github.run_number }}')])
+              ]), 
+            VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+          ]
+        )
+        EOF
+      shell: bash
+        
+    - name: Build EXE with PyInstaller
+      run: |
+        pyinstaller DeepFile_Organizer.spec --clean --noconfirm
+        
+    - name: Verify build
+      run: |
+        if (Test-Path "dist\DeepFile_Organizer.exe") {
+          Write-Host "✓ EXE built successfully"
+          $size = (Get-Item "dist\DeepFile_Organizer.exe").Length / 1MB
+          Write-Host "File size: $([math]::Round($size, 2)) MB"
+          
+          # Show EXE version info
+          Write-Host "EXE details:"
+          (Get-Item "dist\DeepFile_Organizer.exe").VersionInfo | Format-List
+        } else {
+          Write-Error "EXE file not found!"
+          exit 1
+        }
+      shell: pwsh
+        
+    - name: Delete old artifacts
+      uses: geekyeggo/delete-artifact@v5
+      with:
+        name: DeepFile_Organizer_Windows_EXE
+        failOnError: false
+        
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: DeepFile_Organizer_Windows_EXE
+        path: dist/DeepFile_Organizer.exe
+        if-no-files-found: error
+        retention-days: 1  # 只保留 1 天
+        
+    - name: Create Release
+      if: github.event.inputs.create_release == 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/DeepFile_Organizer.exe
+        tag_name: ${{ github.event.inputs.version || format('v{0}', github.run_number) }}
+        name: Build ${{ github.event.inputs.version || format('v{0}', github.run_number) }} - PDF Lock Fix
+        body: |
+          🚀 Manual build from GitHub Actions
+          
+          **Build Info:**
+          - Commit: ${{ github.sha }}
+          - Author: ${{ github.actor }}
+          - Date: ${{ github.event.head_commit.timestamp }}
+          - Build Number: ${{ github.run_number }}
+          
+          **Features:**
+          - ✅ PDF conversion with isolated subprocess
+          - ✅ File lock avoidance mechanisms
+          - ✅ Enhanced error handling
+          - ✅ Support for docx2pdf and reportlab
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
