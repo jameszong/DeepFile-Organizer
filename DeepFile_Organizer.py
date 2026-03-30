@@ -5546,6 +5546,7 @@ class FileToolApp:
                 self.root.after(0, lambda: self.log("开始转换为PDF..."))
                 
                 # 使用 win32com + 扩展名欺骗进行 PDF 转换
+                import tempfile
                 pdf_errors = []
                 
                 # 获取所有 Word 文件
