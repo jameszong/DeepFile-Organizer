@@ -5545,82 +5545,18 @@ class FileToolApp:
                 self.root.after(0, lambda: self.tab6_status_var.set("转换为PDF中..."))
                 self.root.after(0, lambda: self.log("开始转换为PDF..."))
                 
-                # 使用完全隔离的子进程进行 PDF 转换（彻底避免文件锁定）
+                # 使用 aspose-words 进行 PDF 转换（避免 Word 进程）
                 try:
-                    import subprocess
-                    import tempfile
-                    import json
-                    import shutil
+                    import aspose.words as aw
                     
                     pdf_dir = os.path.join(output_dir, "PDF文件")
+                    os.makedirs(pdf_dir, exist_ok=True)
                     pdf_errors = []
                     
-                    self.root.after(0, lambda: self.log("使用隔离子进程进行 PDF 转换（彻底避免文件锁定）..."))
+                    self.root.after(0, lambda: self.log("使用 Aspose.Words 进行 PDF 转换（无 Word 进程）..."))
                     
                     # 获取所有 Word 文件
                     word_files = [f for f in os.listdir(output_dir) if f.endswith('.docx')]
-                    
-                    # 创建隔离的转换脚本
-                    converter_script = os.path.join(tempfile.gettempdir(), "isolated_pdf_converter.py")
-                    script_content = '''
-import sys
-import os
-import tempfile
-import time
-import docx2pdf
-from pathlib import Path
-import json
-
-def convert_docx_to_pdf_isolated(docx_path, output_dir):
-    """在隔离环境中转换 DOCX 到 PDF"""
-    try:
-        # 在临时目录中生成 PDF
-        temp_dir = tempfile.mkdtemp()
-        temp_pdf_path = os.path.join(temp_dir, "temp.pdf")
-        
-        # 转换
-        docx2pdf.convert(docx_path, temp_pdf_path)
-        
-        # 等待文件生成
-        max_wait = 10
-        wait_time = 0
-        while wait_time < max_wait:
-            if os.path.exists(temp_pdf_path) and os.path.getsize(temp_pdf_path) > 0:
-                break
-            time.sleep(0.5)
-            wait_time += 0.5
-        
-        if not os.path.exists(temp_pdf_path):
-            raise Exception("PDF 生成失败")
-        
-        # 返回临时文件路径
-        return {
-            "success": True,
-            "temp_pdf_path": temp_pdf_path,
-            "file_size": os.path.getsize(temp_pdf_path)
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-if __name__ == "__main__":
-    # 从命令行参数获取输入
-    if len(sys.argv) != 3:
-        print(json.dumps({"success": False, "error": "参数错误"}))
-        sys.exit(1)
-    
-    docx_path = sys.argv[1]
-    output_dir = sys.argv[2]
-    
-    result = convert_docx_to_pdf_isolated(docx_path, output_dir)
-    print(json.dumps(result))
-'''
-                    
-                    with open(converter_script, 'w', encoding='utf-8') as f:
-                        f.write(script_content)
                     
                     # 批量转换
                     for i, docx_file in enumerate(word_files):
@@ -5633,40 +5569,15 @@ if __name__ == "__main__":
                             
                             start_time = time.time()
                             
-                            # 创建隔离的临时输出目录
-                            with tempfile.TemporaryDirectory(prefix="pdf_isolated_") as temp_output_dir:
-                                # 在子进程中运行转换（完全隔离）
-                                result = subprocess.run(
-                                    [sys.executable, converter_script, docx_path, temp_output_dir],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=60
-                                )
-                                
-                                if result.returncode == 0:
-                                    # 解析结果
-                                    try:
-                                        convert_result = json.loads(result.stdout.strip())
-                                        
-                                        if convert_result["success"]:
-                                            temp_pdf_path = convert_result["temp_pdf_path"]
-                                            
-                                            # 复制到最终目录（这是关键！）
-                                            shutil.copy2(temp_pdf_path, pdf_path)
-                                            
-                                            file_size = convert_result["file_size"]
-                                            conversion_time = time.time() - start_time
-                                            
-                                            success_msg = f"PDF转换成功: {docx_file} (耗时: {conversion_time:.2f}s, 大小: {file_size//1024}KB)"
-                                            self.root.after(0, lambda msg=success_msg: self.log(msg))
-                                            
-                                        else:
-                                            raise Exception(convert_result["error"])
-                                            
-                                    except json.JSONDecodeError:
-                                        raise Exception("转换结果解析失败")
-                                else:
-                                    raise Exception(f"转换进程失败: {result.stderr}")
+                            # 使用 Aspose.Words 转换（纯内存操作，无外部进程）
+                            doc = aw.Document(docx_path)
+                            doc.save(pdf_path)
+                            
+                            file_size = os.path.getsize(pdf_path)
+                            conversion_time = time.time() - start_time
+                            
+                            success_msg = f"PDF转换成功: {docx_file} (耗时: {conversion_time:.2f}s, 大小: {file_size//1024}KB)"
+                            self.root.after(0, lambda msg=success_msg: self.log(msg))
                             
                             completed_tasks += 1
                             
@@ -5677,19 +5588,25 @@ if __name__ == "__main__":
                                 self.tab6_status_var.set(s)
                             ))
                             
+                            # 内存回收
+                            del doc
+                            if (i + 1) % 10 == 0:
+                                gc.collect()
+                            
                         except Exception as e:
                             pdf_errors.append(f"{docx_file}: {str(e)}")
                             pdf_error_msg = f"  × PDF转换失败 {docx_file}: {e}"
                             self.root.after(0, lambda msg=pdf_error_msg: self.log(msg))
-                    
-                    # 清理脚本文件
-                    try:
-                        os.unlink(converter_script)
-                    except:
-                        pass
                             
                 except ImportError as e:
-                    self.root.after(0, lambda: messagebox.showerror("错误", f"缺少依赖: {e}"))
+                    error_msg = f"缺少 aspose-words 库。请运行: pip install aspose-words"
+                    self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
+                    self.root.after(0, lambda msg=error_msg: self.log(msg))
+                    return
+                except Exception as e:
+                    error_msg = f"PDF转换初始化失败: {e}"
+                    self.root.after(0, lambda: messagebox.showerror("错误", error_msg))
+                    self.root.after(0, lambda msg=error_msg: self.log(msg))
                     return
             
             # 任务完成
