@@ -5548,6 +5548,7 @@ class FileToolApp:
                 # 使用 win32com + 扩展名欺骗进行 PDF 转换（优化版）
                 import tempfile
                 import win32gui
+                import win32con
                 
                 pdf_errors = []
                 
@@ -5570,7 +5571,7 @@ class FileToolApp:
                         if win32gui.IsWindowVisible(hwnd):
                             window_title = win32gui.GetWindowText(hwnd)
                             if 'Microsoft Word' in window_title or 'Word' in window_title:
-                                win32gui.ShowWindow(hwnd, win32gui.SW_HIDE)
+                                win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
                         return True
                     
                     # 初始化 COM
