@@ -5586,16 +5586,14 @@ class FileToolApp:
                         try:
                             start_time = time.time()
                             
-                            # 使用 docx2pdf 转换（后台运行，无窗口）
-                            result = subprocess.run(
-                                ['docx2pdf', docx_path, temp_obfuscated_path],
-                                capture_output=True,
-                                text=True,
-                                timeout=30  # 30秒超时
-                            )
+                            # 使用 docx2pdf Python API
+                            from docx2pdf import convert
+                            
+                            # 转换到临时 .dat 文件
+                            convert(docx_path, temp_obfuscated_path)
                             
                             # 检查转换结果
-                            if result.returncode == 0 and os.path.exists(temp_obfuscated_path) and os.path.getsize(temp_obfuscated_path) > 0:
+                            if os.path.exists(temp_obfuscated_path) and os.path.getsize(temp_obfuscated_path) > 0:
                                 # 移动并重命名文件
                                 shutil.move(temp_obfuscated_path, final_pdf_path)
                                 
@@ -5607,11 +5605,10 @@ class FileToolApp:
                                 
                                 completed_tasks += 1
                             else:
-                                error_msg = f"docx2pdf 转换失败: {result.stderr}"
-                                raise Exception(error_msg)
+                                raise Exception("PDF文件未生成")
                                 
-                        except subprocess.TimeoutExpired:
-                            error_msg = "docx2pdf 转换超时"
+                        except ImportError:
+                            error_msg = "docx2pdf 模块导入失败，请确保已安装: pip install docx2pdf"
                             pdf_errors.append(f"{docx_file}: {error_msg}")
                             pdf_error_msg = f"  × PDF转换失败 {docx_file}: {error_msg}"
                             self.root.after(0, lambda msg=pdf_error_msg: self.log(msg))
