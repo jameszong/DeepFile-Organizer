@@ -11,6 +11,8 @@ import asyncio
 import hashlib
 import traceback
 import subprocess
+import fnmatch
+import base64
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from datetime import datetime
@@ -244,6 +246,29 @@ class DatabaseManager:
             )
         ''')
         
+        # Tab7缓存表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tab7_extract_cache (
+                file_hash TEXT PRIMARY KEY,
+                file_path TEXT,
+                key_value TEXT,
+                extracted_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Tab8缓存表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tab8_extract_cache (
+                file_hash TEXT PRIMARY KEY,
+                file_path TEXT,
+                extracted_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         conn.commit()
         conn.close()
     
@@ -386,6 +411,7 @@ class DatabaseManager:
         conn.close()
         if result:
             return {
+                'file_hash': file_hash,  # 添加file_hash键
                 'file_path': result[0],
                 'file_name': result[1],
                 'file_type': result[2],
@@ -475,21 +501,130 @@ class DatabaseManager:
         import sqlite3
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
+        
+        # 检查token_usage表是否存在
+        cursor.execute('''
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='token_usage'
+        ''')
+        token_table_exists = cursor.fetchone() is not None
+        
+        token_stats = {}
+        
+        # 从新的token_usage表获取统计数据（如果表存在）
+        if token_table_exists:
+            cursor.execute('''
+                SELECT model_type, SUM(tokens)
+                FROM token_usage
+                WHERE task_id = ?
+                GROUP BY model_type
+            ''', (task_id,))
+            new_results = cursor.fetchall()
+            
+            # 处理新表数据
+            for model_type, tokens in new_results:
+                token_stats[model_type] = tokens or 0
+        
+        # 从旧的file_metadata表获取统计数据（兼容性）
         cursor.execute('''
             SELECT SUM(fm.ocr_token_usage), SUM(fm.vector_token_usage)
             FROM file_metadata fm
             JOIN classification_results cr ON fm.file_hash = cr.file_hash
             WHERE cr.task_id = ?
         ''', (task_id,))
+        old_result = cursor.fetchone()
+        
+        conn.close()
+        
+        # 处理旧表数据（兼容性）
+        if old_result:
+            token_stats['ocr'] = token_stats.get('ocr', 0) + (old_result[0] or 0)
+            token_stats['vector'] = token_stats.get('vector', 0) + (old_result[1] or 0)
+        
+        # 计算总计
+        total = sum(token_stats.values())
+        token_stats['total'] = total
+        
+        return token_stats
+    
+    # ========== Tab7 缓存数据库操作 ==========
+    
+    def save_tab7_cache(self, file_hash: str, file_path: str, key_value: str, extracted_data: dict):
+        """保存Tab7提取缓存"""
+        import sqlite3
+        import json
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO tab7_extract_cache 
+            (file_hash, file_path, key_value, extracted_data, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (file_hash, file_path, key_value, json.dumps(extracted_data, ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+    
+    def get_tab7_cache(self, file_hash: str):
+        """获取Tab7提取缓存"""
+        import sqlite3
+        import json
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT file_path, key_value, extracted_data
+            FROM tab7_extract_cache WHERE file_hash = ?
+        ''', (file_hash,))
         result = cursor.fetchone()
         conn.close()
         if result:
-            return {
-                'ocr_tokens': result[0] or 0,
-                'vector_tokens': result[1] or 0,
-                'total_tokens': (result[0] or 0) + (result[1] or 0)
-            }
-        return {'ocr_tokens': 0, 'vector_tokens': 0, 'total_tokens': 0}
+            try:
+                extracted_data = json.loads(result[2])
+                return {
+                    'file_path': result[0],
+                    'key_value': result[1],
+                    'extracted_data': extracted_data
+                }
+            except:
+                return None
+        return None
+    
+    # ========== Tab8 缓存数据库操作 ==========
+    
+    def save_tab8_cache(self, file_hash: str, file_path: str, extracted_data: dict):
+        """保存Tab8提取缓存"""
+        import sqlite3
+        import json
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO tab8_extract_cache 
+            (file_hash, file_path, extracted_data, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (file_hash, file_path, json.dumps(extracted_data, ensure_ascii=False)))
+        conn.commit()
+        conn.close()
+    
+    def get_tab8_cache(self, file_hash: str):
+        """获取Tab8提取缓存"""
+        import sqlite3
+        import json
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT file_path, extracted_data
+            FROM tab8_extract_cache WHERE file_hash = ?
+        ''', (file_hash,))
+        result = cursor.fetchone()
+        conn.close()
+        if result:
+            try:
+                extracted_data = json.loads(result[1])
+                return {
+                    'file_path': result[0],
+                    'extracted_data': extracted_data
+                }
+            except:
+                return None
+        return None
     
     def save_log(self, timestamp: str, message: str):
         """保存日志到数据库"""
@@ -529,6 +664,31 @@ class DatabaseManager:
         results = cursor.fetchall()
         conn.close()
         return results
+    
+    def log_token_usage(self, task_id: int, model_type: str, tokens: int):
+        """记录Token使用情况"""
+        import sqlite3
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        # 创建token使用表（如果不存在）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER,
+                model_type TEXT,
+                tokens INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_id) REFERENCES tasks(id)
+            )
+        ''')
+        
+        cursor.execute('''
+            INSERT INTO token_usage (task_id, model_type, tokens)
+            VALUES (?, ?, ?)
+        ''', (task_id, model_type, tokens))
+        conn.commit()
+        conn.close()
 
 
 class RateLimiter:
@@ -672,7 +832,6 @@ class VectorManager:
                 return vectors, token_usage
 
             raise ValueError(f"DashScope返回中未包含embedding数据: {data}")
-            return vectors, token_usage
         except Exception as e:
             print(f"API调用失败: {e}")
             return [np.zeros(self.embedding_dim, dtype=np.float32) for _ in texts], 0
@@ -877,6 +1036,8 @@ class FileToolApp:
         self.tab4 = tk.Frame(self.notebook, bg=COLORS['bg_primary'], padx=16, pady=16)
         self.tab5 = tk.Frame(self.notebook, bg=COLORS['bg_primary'], padx=16, pady=16)
         self.tab6 = tk.Frame(self.notebook, bg=COLORS['bg_primary'], padx=16, pady=16)
+        self.tab7 = tk.Frame(self.notebook, bg=COLORS['bg_primary'], padx=16, pady=16)
+        self.tab8 = tk.Frame(self.notebook, bg=COLORS['bg_primary'], padx=16, pady=16)
 
         self.notebook.add(self.tab1, text="📁 文件批量提取")
         self.notebook.add(self.tab2, text="📄 PDF智能重命名")
@@ -884,6 +1045,8 @@ class FileToolApp:
         self.notebook.add(self.tab4, text="📂 智能文件归档")
         self.notebook.add(self.tab5, text="🧠 向量智能归档")
         self.notebook.add(self.tab6, text="📝 文件批量填充")
+        self.notebook.add(self.tab7, text="🔍 按需提取文档内容")
+        self.notebook.add(self.tab8, text="📋 批量信息提取")
 
         # 下部：日志区域 - 固定高度
         self.log_frame = tk.LabelFrame(self.main_paned, 
@@ -940,6 +1103,8 @@ class FileToolApp:
         self.setup_tab4()
         self.setup_tab5()
         self.setup_tab6()
+        self.setup_tab7()
+        self.setup_tab8()
         
         self.log("DeepFile Organizer 已启动 - Enterprise Edition")
         self.log("基于 Minimalism + Enterprise 设计规范重构")
@@ -1151,9 +1316,9 @@ class FileToolApp:
 
     # ================= Tab 1: 文件批量提取 (Enterprise风格) =================
     def setup_tab1(self):
-        self.src_path_var = tk.StringVar()
-        self.dest_path_var = tk.StringVar()
-        self.rename_by_folder_var = tk.BooleanVar(value=False)
+        self.tab1_src_path_var = tk.StringVar()
+        self.tab1_dest_path_var = tk.StringVar()
+        self.tab1_rename_by_folder_var = tk.BooleanVar(value=False)
 
         frame = self.tab1
         frame.configure(bg=COLORS['bg_primary'])
@@ -1179,14 +1344,14 @@ class FileToolApp:
         src_row = tk.Frame(src_card, bg=COLORS['bg_primary'])
         src_row.pack(fill="x")
         tk.Entry(src_row, 
-                textvariable=self.src_path_var,
+                textvariable=self.tab1_src_path_var,
                 bg=COLORS['input_bg'],
                 fg=COLORS['text_primary'],
                 insertbackground=COLORS['text_primary'],
                 relief='solid',
                 highlightthickness=1,
                 highlightcolor=COLORS['border']).pack(side="left", padx=(0, 8), fill="x", expand=True)
-        self.create_secondary_button(src_row, "浏览...", lambda: self.select_dir(self.src_path_var)).pack(side="right")
+        self.create_secondary_button(src_row, "浏览...", lambda: self.select_dir(self.tab1_src_path_var)).pack(side="right")
 
         # 2. 筛选条件卡片
         filter_card = self.create_card(frame, "筛选条件")
@@ -1201,13 +1366,13 @@ class FileToolApp:
                 bg=COLORS['bg_primary'],
                 fg=COLORS['text_secondary'],
                 font=('微软雅黑', 9)).grid(row=0, column=0, sticky="w", pady=6)
-        self.name_pattern_entry = tk.Entry(filter_grid, width=45, 
+        self.tab1_name_pattern_entry = tk.Entry(filter_grid, width=45, 
                                           bg=COLORS['input_bg'],
                                           fg=COLORS['text_primary'],
                                           insertbackground=COLORS['text_primary'],
                                           relief='solid', highlightthickness=1, highlightcolor=COLORS['border'])
-        self.name_pattern_entry.insert(0, "*仲裁申请书*") 
-        self.name_pattern_entry.grid(row=0, column=1, padx=(12, 0), sticky="w")
+        self.tab1_name_pattern_entry.insert(0, "*仲裁申请书*") 
+        self.tab1_name_pattern_entry.grid(row=0, column=1, padx=(12, 0), sticky="w")
 
         # 后缀名
         tk.Label(filter_grid, 
@@ -1215,20 +1380,20 @@ class FileToolApp:
                 bg=COLORS['bg_primary'],
                 fg=COLORS['text_secondary'],
                 font=('微软雅黑', 9)).grid(row=1, column=0, sticky="w", pady=6)
-        self.ext_entry = tk.Entry(filter_grid, width=45, 
+        self.tab1_ext_entry = tk.Entry(filter_grid, width=45, 
                                 bg=COLORS['input_bg'],
                                 fg=COLORS['text_primary'],
                                 insertbackground=COLORS['text_primary'],
                                 relief='solid', highlightthickness=1, highlightcolor=COLORS['border'])
-        self.ext_entry.insert(0, "pdf, doc, docx")
-        self.ext_entry.grid(row=1, column=1, padx=(12, 0), sticky="w")
+        self.tab1_ext_entry.insert(0, "pdf, doc, docx")
+        self.tab1_ext_entry.grid(row=1, column=1, padx=(12, 0), sticky="w")
 
         # 冲突处理选项
         conflict_frame = tk.Frame(filter_card, bg=COLORS['bg_primary'])
         conflict_frame.pack(fill="x", pady=(12, 0))
         tk.Checkbutton(conflict_frame, 
                       text="重命名冲突文件：[来源文件夹名]_[原文件名]",
-                      variable=self.rename_by_folder_var,
+                      variable=self.tab1_rename_by_folder_var,
                       bg=COLORS['bg_primary'],
                       fg=COLORS['text_primary'],
                       selectcolor=COLORS['bg_primary'],
@@ -1241,14 +1406,14 @@ class FileToolApp:
         dest_row = tk.Frame(dest_card, bg=COLORS['bg_primary'])
         dest_row.pack(fill="x")
         tk.Entry(dest_row, 
-                textvariable=self.dest_path_var,
+                textvariable=self.tab1_dest_path_var,
                 bg=COLORS['input_bg'],
                 fg=COLORS['text_primary'],
                 insertbackground=COLORS['text_primary'],
                 relief='solid',
                 highlightthickness=1,
                 highlightcolor=COLORS['border']).pack(side="left", padx=(0, 8), fill="x", expand=True)
-        self.create_secondary_button(dest_row, "浏览...", lambda: self.select_dir(self.dest_path_var)).pack(side="right")
+        self.create_secondary_button(dest_row, "浏览...", lambda: self.select_dir(self.tab1_dest_path_var)).pack(side="right")
 
         # 执行按钮区域
         action_frame = tk.Frame(frame, bg=COLORS['bg_primary'])
@@ -1257,11 +1422,11 @@ class FileToolApp:
 
     def start_extract_task(self):
         # Tab 1 的核心逻辑
-        src_dir = self.src_path_var.get().strip()
-        target_dir = self.dest_path_var.get().strip()
-        name_pattern = self.name_pattern_entry.get().strip()
-        ext_input = self.ext_entry.get().strip()
-        use_folder_prefix = self.rename_by_folder_var.get()
+        src_dir = self.tab1_src_path_var.get().strip()
+        target_dir = self.tab1_dest_path_var.get().strip()
+        name_pattern = self.tab1_name_pattern_entry.get().strip()
+        ext_input = self.tab1_ext_entry.get().strip()
+        use_folder_prefix = self.tab1_rename_by_folder_var.get()
 
         if not src_dir or not os.path.exists(src_dir):
             messagebox.showerror("错误", "源文件夹无效！")
@@ -5946,7 +6111,7 @@ class FileToolApp:
         return name
 
     def _get_file_content_with_pages_tab5(self, file_path, page_nums):
-        """获取Tab5文件多页内容（PDF或图片）"""
+        """获取Tab5文件多页内容（PDF或图片）- 智能提取PDF原生文本"""
         contents = []
         ext = os.path.splitext(file_path)[1].lower()
 
@@ -5958,10 +6123,48 @@ class FileToolApp:
                 for page_num in page_nums:
                     if page_num < 1 or page_num > total_pages:
                         continue
+                    
                     page = doc.load_page(page_num - 1)
-                    pix = page.get_pixmap(dpi=150)
-                    img_bytes = pix.tobytes("png")
-                    contents.append((page_num, img_bytes))
+                    
+                    # 策略1: 尝试直接提取PDF原生文本
+                    try:
+                        text_content = page.get_text()
+                        if text_content.strip():
+                            # 检查提取的文本质量
+                            cleaned_text = text_content.strip()
+                            
+                            # 质量检测1: 最小长度要求
+                            if len(cleaned_text) >= 10:
+                                # 质量检测2: 包含中文字符或足够多的英文字符
+                                chinese_chars = len([c for c in cleaned_text if '\u4e00' <= c <= '\u9fff'])
+                                english_words = len([w for w in cleaned_text.split() if w.isalpha() and len(w) > 2])
+                                
+                                # 质量检测3: 不是纯数字或特殊字符
+                                meaningful_content = (
+                                    chinese_chars >= 5 or  # 至少5个中文字符
+                                    english_words >= 3 or   # 至少3个英文单词
+                                    len(cleaned_text) >= 50  # 或者总长度足够长
+                                )
+                                
+                                if meaningful_content:
+                                    self.log(f"  [直接提取] 第{page_num}页原生文本 ({len(cleaned_text)}字符, 中文{chinese_chars}字, 英文{english_words}词)")
+                                    contents.append((page_num, text_content.encode('utf-8')))
+                                    continue
+                                else:
+                                    self.log(f"  [文本质量不足] 第{page_num}页，将使用OCR")
+                            else:
+                                self.log(f"  [文本过短] 第{page_num}页 ({len(cleaned_text)}字符)，将使用OCR")
+                    except Exception as e:
+                        self.log(f"  [直接提取失败] 第{page_num}页: {e}")
+                    
+                    # 策略2: 如果直接提取失败或文本质量差，使用OCR
+                    try:
+                        pix = page.get_pixmap(dpi=150)
+                        img_bytes = pix.tobytes("png")
+                        contents.append((page_num, img_bytes))
+                        self.log(f"  [OCR准备] 第{page_num}页将使用OCR识别")
+                    except Exception as e:
+                        self.log(f"  [OCR准备失败] 第{page_num}页: {e}")
 
                 doc.close()
             elif ext in ['.jpg', '.jpeg', '.png']:
@@ -5980,7 +6183,7 @@ class FileToolApp:
                 self.log("  正在初始化Tab5本地OCR引擎(RapidOCR)，请稍候...")
                 try:
                     # 动态导入 RapidOCR
-                    from rapidocr import RapidOCR
+                    from rapidocr_onnxruntime import RapidOCR
                     ocr_result = [None]
                     def init_ocr():
                         try:
@@ -6001,7 +6204,7 @@ class FileToolApp:
                     self.tab5_ocr_engine = ocr_result[0]
                     self.log("  ✓ Tab5本地OCR引擎初始化完成")
                 except ImportError:
-                    self.log("  ⚠️ 未安装RapidOCR，跳过本地OCR")
+                    self.log("  ⚠️ 未安装rapidocr-onnxruntime，跳过本地OCR")
                     self.tab5_ocr_engine = "not_installed"
                     return ""
                 except Exception as e:
@@ -6127,26 +6330,39 @@ class FileToolApp:
         ocr_model_id = ''
         ocr_token_usage = 0
         
-        for page_num, img_bytes in contents:
-            text = self._ocr_local_tab5(img_bytes, file_path)
-            if text:
-                ocr_text += text + '\n'
-                ocr_source = 'local'
+        for page_num, content in contents:
+            # 检查是直接提取的文本还是图片数据
+            if isinstance(content, bytes) and content.startswith(b'\x89PNG'):  # PNG图片
+                # OCR处理图片
+                text = self._ocr_local_tab5(content, file_path)
+                if text:
+                    ocr_text += text + '\n'
+                    ocr_source = 'local'
+                else:
+                    api_key = self.tab5_ocr_api_key_var.get().strip()
+                    model_id = self.tab5_ocr_model_var.get()
+                    
+                    if api_key:
+                        llm_text, token_usage = self._ocr_llm_fallback_tab5(
+                            content,
+                            ocr_max_chars,
+                            self.tab5_ocr_prompt_var.get().strip()
+                        )
+                        if llm_text:
+                            ocr_text += llm_text + '\n'
+                            ocr_source = 'llm'
+                            ocr_model_id = model_id
+                            ocr_token_usage += token_usage.get('total_tokens', 0)
             else:
-                api_key = self.tab5_ocr_api_key_var.get().strip()
-                model_id = self.tab5_ocr_model_var.get()
-                
-                if api_key:
-                    llm_text, token_usage = self._ocr_llm_fallback_tab5(
-                        img_bytes,
-                        ocr_max_chars,
-                        self.tab5_ocr_prompt_var.get().strip()
-                    )
-                    if llm_text:
-                        ocr_text += llm_text + '\n'
-                        ocr_source = 'llm'
-                        ocr_model_id = model_id
-                        ocr_token_usage += token_usage.get('total_tokens', 0)
+                # 直接提取的文本内容
+                try:
+                    text_content = content.decode('utf-8') if isinstance(content, bytes) else str(content)
+                    if text_content.strip():
+                        ocr_text += text_content + '\n'
+                        ocr_source = 'direct'  # 标记为直接提取
+                        self.log(f"  [直接提取成功] 第{page_num}页添加到内容")
+                except Exception as e:
+                    self.log(f"  [直接提取处理失败] 第{page_num}页: {e}")
         
         # 获取文件名（不含扩展名）
         file_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -6217,16 +6433,26 @@ class FileToolApp:
             source_dir = self.tab5_source_dir_var.get().strip()
             dest_dir = self.tab5_dest_dir_var.get().strip()
             
-            # 遍历源目录获取所有文件
+            # 遍历源目录获取所有文件（排除目标目录）
             all_files = []
+            abs_source = os.path.abspath(source_dir)
+            abs_dest = os.path.abspath(dest_dir)
+            
             for root, dirs, files in os.walk(source_dir):
+                abs_root = os.path.abspath(root)
+                
+                # 如果当前目录是目标目录或其子目录，跳过
+                if abs_root.startswith(abs_dest):
+                    self.log(f"  跳过目标目录: {root}")
+                    continue
+                
                 for filename in files:
                     file_path = os.path.join(root, filename)
                     ext = os.path.splitext(filename)[1].lower()
                     if ext in ['.pdf', '.jpg', '.jpeg', '.png']:
                         all_files.append(file_path)
             
-            self.log(f"找到 {len(all_files)} 个待处理文件")
+            self.log(f"找到 {len(all_files)} 个待处理文件（已排除目标目录）")
             
             # 阶段1：预处理所有文件（OCR + 向量化）
             self.log("--- 阶段1: 文件预处理和向量化 ---")
@@ -6293,7 +6519,12 @@ class FileToolApp:
                 
                 texts = list(key_values.values())
                 cols = list(key_values.keys())
-                vecs, _ = vector_manager.get_embedding(texts)
+                
+                try:
+                    vecs, _ = vector_manager.get_embedding(texts)
+                except Exception as e:
+                    self.log(f"  向量生成失败 第{idx+1}行: {e}")
+                    continue  # 跳过这一行，继续处理下一行
                 
                 key_vectors = {}
                 for ci, col_name in enumerate(cols):
@@ -6306,21 +6537,30 @@ class FileToolApp:
                         'key_values': key_values,
                         'key_vectors': key_vectors
                     })
+                else:
+                    self.log(f"  [DEBUG] 第{idx+1}行向量生成失败: vectors为空")
                 
                 if (idx + 1) % 50 == 0:
-                    self.log(f"  已预计算 {idx+1} 行...")
+                    self.log(f"  已预计算 {idx+1} 行，有效数据 {len(row_data_list)} 行")
             
             self.log(f"  预计算完成: {len(row_data_list)} 条有效数据行")
             
-            # 2b: 反向匹配 - 遍历每个文件，找其最佳数据行 (argmax + 底线阈值)
-            self.log(f"  反向匹配中（底线阈值: {BASE_THRESHOLD}）...")
+            # 2b: 反向匹配 - 遍历每个文件，找其最佳数据行
+            # 策略：精确匹配优先 + 向量匹配补充
+            self.log(f"  反向匹配中（精确匹配优先，向量阈值: {BASE_THRESHOLD}）...")
             
             categorized = {}
             unmatched_files = []
+            exact_match_count = 0
+            vector_match_count = 0
             
             for fi, file_meta in enumerate(file_metadata_list):
                 if self.tab5_stop_flag:
                     break
+                
+                # 获取文件的OCR文本用于精确匹配
+                ocr_text = file_meta.get('ocr_text', '').lower()
+                file_name = file_meta.get('file_name', '').lower()
                 
                 content_vec = file_meta.get('content_vector')
                 name_vec = file_meta.get('name_vector')
@@ -6341,6 +6581,55 @@ class FileToolApp:
                 if meta_vec is not None:
                     file_sources.append(('meta', meta_vec))
                 
+                # ========== 策略1: 精确匹配优先 ==========
+                exact_matched_row = None
+                exact_matched_cols = []
+                
+                for row_data in row_data_list:
+                    matched_abs_cols = []
+                    
+                    # 检查绝对关键列是否精确匹配
+                    for abs_col in key_columns['absolute']:
+                        if abs_col in row_data['key_values']:
+                            key_value = str(row_data['key_values'][abs_col]).strip()
+                            # 精确匹配：关键值必须完整出现在文件内容或文件名中
+                            if key_value and (key_value.lower() in ocr_text or key_value.lower() in file_name):
+                                matched_abs_cols.append(abs_col)
+                    
+                    # 如果至少匹配一个绝对关键列，认为精确匹配成功
+                    if len(matched_abs_cols) >= 1:
+                        exact_matched_row = row_data
+                        exact_matched_cols = matched_abs_cols
+                        break  # 找到第一个精确匹配就停止
+                
+                # 如果精确匹配成功，直接归档
+                if exact_matched_row:
+                    row_idx = exact_matched_row['row_idx']
+                    if row_idx not in categorized:
+                        categorized[row_idx] = []
+                    
+                    # 详细匹配日志
+                    matched_values = ', '.join([f"{col}={exact_matched_row['key_values'][col]}" for col in exact_matched_cols])
+                    self.log(f"  ✓ [精确] {os.path.basename(file_meta['file_path'])} → 第{row_idx+1}行 ({matched_values})")
+                    
+                    categorized[row_idx].append({
+                        'file_meta': file_meta,
+                        'score': 1000,  # 精确匹配给予最高分
+                        'max_similarity': 1.0,
+                        'matched_columns': exact_matched_cols,
+                        'weight_details': json.dumps([{
+                            'column': col,
+                            'value': exact_matched_row['key_values'][col],
+                            'source': 'exact_match',
+                            'similarity': 1.0,
+                            'score': 1000
+                        } for col in exact_matched_cols], ensure_ascii=False),
+                        'key_values': exact_matched_row['key_values']
+                    })
+                    exact_match_count += 1
+                    continue  # 跳过向量匹配
+                
+                # ========== 策略2: 向量匹配补充 ==========
                 if not file_sources:
                     unmatched_files.append(file_meta)
                     continue
@@ -6394,6 +6683,11 @@ class FileToolApp:
                     row_idx = best_row_data['row_idx']
                     if row_idx not in categorized:
                         categorized[row_idx] = []
+                    
+                    # 详细匹配日志
+                    matched_values = ', '.join([f"{col}={best_row_data['key_values'][col]}" for col in list(abs_matched)[:2]])
+                    self.log(f"  ✓ [向量] {os.path.basename(file_meta['file_path'])} → 第{row_idx+1}行 (相似度:{best_max_sim:.3f}, {matched_values})")
+                    
                     categorized[row_idx].append({
                         'file_meta': file_meta,
                         'score': best_total_score,
@@ -6402,14 +6696,23 @@ class FileToolApp:
                         'weight_details': json.dumps(best_details, ensure_ascii=False),
                         'key_values': best_row_data['key_values']
                     })
+                    vector_match_count += 1
                 else:
+                    # 未匹配日志
+                    if best_row_data:
+                        self.log(f"  × [未匹配] {os.path.basename(file_meta['file_path'])} (最高相似度:{best_max_sim:.3f} < {BASE_THRESHOLD})")
+                    else:
+                        self.log(f"  × [未匹配] {os.path.basename(file_meta['file_path'])} (无向量数据)")
                     unmatched_files.append(file_meta)
                 
                 if (fi + 1) % 10 == 0:
-                    self.log(f"  已匹配 {fi+1}/{len(file_metadata_list)} 个文件")
+                    self.log(f"  已匹配 {fi+1}/{len(file_metadata_list)} 个文件 (精确:{exact_match_count}, 向量:{vector_match_count})")
             
             matched_total = sum(len(v) for v in categorized.values())
-            self.log(f"--- 反向匹配完成: {matched_total} 个文件→{len(categorized)} 条数据行, {len(unmatched_files)} 个未匹配 ---")
+            self.log(f"--- 反向匹配完成: {matched_total} 个文件→{len(categorized)} 条数据行 ---")
+            self.log(f"    精确匹配: {exact_match_count} 个文件")
+            self.log(f"    向量匹配: {vector_match_count} 个文件")
+            self.log(f"    未匹配: {len(unmatched_files)} 个文件")
             
             # 阶段3：归档
             self.log("--- 阶段3: 归档文件 ---")
@@ -6568,10 +6871,1439 @@ class FileToolApp:
             self.log(f"向量归档任务错误: {e}")
             import traceback
             traceback.print_exc()
-            self.root.after(0, lambda: messagebox.showerror("错误", f"任务失败:\n{e}"))
+            error_msg = f"任务失败:\n{e}"
+            self.root.after(0, lambda msg=error_msg: messagebox.showerror("错误", msg))
         finally:
             self.update_tab5_ui_state(False)
 
+    def setup_tab7(self):
+        """设置Tab7: 按需提取文档内容"""
+        frame = self.tab7
+        frame.configure(bg=COLORS['bg_primary'])
+        
+        # Tab7相关变量
+        self.tab7_df = None
+        self.tab7_is_running = False
+        self.tab7_stop_flag = False
+        self.tab7_pause_flag = False
+        self.tab7_processed_files = []  # 已处理文件列表
+        self.tab7_current_index = 0  # 当前处理索引
+        self.tab7_task_id = None  # 任务ID
+        self.tab7_skip_hash_check_var = tk.BooleanVar(value=False)  # 跳过hash检查
+        
+        # Tab7变量
+        self.tab7_excel_path_var = tk.StringVar()
+        self.tab7_key_column_var = tk.StringVar()
+        self.tab7_source_dir_var = tk.StringVar()
+        self.tab7_file_pattern_var = tk.StringVar()
+        self.tab7_page_numbers_var = tk.StringVar()
+        self.tab7_api_key_var = tk.StringVar()
+        self.tab7_ocr_model_var = tk.StringVar()
+        self.tab7_extract_model_var = tk.StringVar()
+        self.tab7_system_prompt_var = tk.StringVar(value="请从下列文件中提取出我所需要的文字或数据，以json格式返回。")
+        self.tab7_output_dir_var = tk.StringVar()
+        
+        # 增量表头变量（最多10个）
+        self.tab7_header_vars = [tk.StringVar() for _ in range(10)]
+        
+        # 进度相关
+        self.tab7_progress_var = tk.DoubleVar()
+        self.tab7_status_var = tk.StringVar(value="就绪")
+        
+        # 创建滚动容器
+        main_canvas = tk.Canvas(frame, bg=COLORS['bg_primary'], highlightthickness=0)
+        scrollbar = tk.Scrollbar(frame, orient="vertical", command=main_canvas.yview)
+        scrollable_frame = tk.Frame(main_canvas, bg=COLORS['bg_primary'])
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        )
+        
+        main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        main_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 标题
+        title_frame = tk.Frame(scrollable_frame, bg=COLORS['bg_primary'])
+        title_frame.pack(fill="x", pady=(0, 16))
+        tk.Label(title_frame, 
+                text="按需提取文档内容",
+                bg=COLORS['bg_primary'],
+                fg=COLORS['text_primary'],
+                font=('微软雅黑', 16, 'bold')).pack(anchor="w")
+        tk.Label(title_frame,
+                text="根据Excel关键列匹配文件，使用LLM提取指定内容并填充到Excel",
+                bg=COLORS['bg_primary'],
+                fg=COLORS['text_secondary'],
+                font=('微软雅黑', 9)).pack(anchor="w", pady=(4, 0))
+        
+        # 1. Excel配置卡片
+        excel_card = self.create_card(scrollable_frame, "Excel数据配置")
+        excel_card.pack(fill="x", pady=8)
+        
+        excel_grid = tk.Frame(excel_card, bg=COLORS['bg_primary'])
+        excel_grid.pack(fill="x")
+        
+        # Excel文件选择
+        tk.Label(excel_grid, text="Excel文件:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=0, column=0, padx=5, pady=5)
+        tk.Entry(excel_grid, textvariable=self.tab7_excel_path_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(excel_grid, text="浏览", command=self.select_excel_tab7, bg=COLORS['primary'], fg='white', padx=15).grid(row=0, column=2, padx=5, pady=5)
+        
+        # 关键列选择
+        tk.Label(excel_grid, text="关键列:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=1, column=0, padx=5, pady=5)
+        self.tab7_key_column_cb = ttk.Combobox(excel_grid, textvariable=self.tab7_key_column_var, width=47, state="readonly")
+        self.tab7_key_column_cb.grid(row=1, column=1, padx=5, pady=5)
+        
+        # 2. 文件配置卡片
+        file_card = self.create_card(scrollable_frame, "文件处理配置")
+        file_card.pack(fill="x", pady=8)
+        
+        file_grid = tk.Frame(file_card, bg=COLORS['bg_primary'])
+        file_grid.pack(fill="x")
+        
+        # 源目录
+        tk.Label(file_grid, text="源目录:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=0, column=0, padx=5, pady=5)
+        tk.Entry(file_grid, textvariable=self.tab7_source_dir_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(file_grid, text="浏览", command=self.select_source_dir_tab7, bg=COLORS['primary'], fg='white', padx=15).grid(row=0, column=2, padx=5, pady=5)
+        
+        # 文件名模式
+        tk.Label(file_grid, text="文件名模式:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=1, column=0, padx=5, pady=5)
+        tk.Entry(file_grid, textvariable=self.tab7_file_pattern_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=1, column=1, padx=5, pady=5)
+        tk.Label(file_grid, text="如: *-借款合同.pdf", bg=COLORS['bg_primary'], fg=COLORS['text_secondary'], font=('微软雅黑', 8)).grid(row=1, column=2, padx=5, pady=5, sticky='w')
+        
+        # 页码范围
+        tk.Label(file_grid, text="页码范围:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=2, column=0, padx=5, pady=5)
+        tk.Entry(file_grid, textvariable=self.tab7_page_numbers_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=2, column=1, padx=5, pady=5)
+        tk.Label(file_grid, text="如: 1,2,3 或 1-4", bg=COLORS['bg_primary'], fg=COLORS['text_secondary'], font=('微软雅黑', 8)).grid(row=2, column=2, padx=5, pady=5, sticky='w')
+        
+        # 3. LLM配置卡片
+        llm_card = self.create_card(scrollable_frame, "LLM模型配置")
+        llm_card.pack(fill="x", pady=8)
+        
+        llm_grid = tk.Frame(llm_card, bg=COLORS['bg_primary'])
+        llm_grid.pack(fill="x")
+        
+        # API Key
+        tk.Label(llm_grid, text="API Key:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=0, column=0, padx=5, pady=5)
+        tk.Entry(llm_grid, textvariable=self.tab7_api_key_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary'], show="*").grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(llm_grid, text="测试", command=self.test_llm_connection_tab7, bg=COLORS['secondary'], fg='white', padx=15).grid(row=0, column=2, padx=5, pady=5)
+        
+        # OCR模型
+        tk.Label(llm_grid, text="OCR模型ID:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=1, column=0, padx=5, pady=5)
+        tk.Entry(llm_grid, textvariable=self.tab7_ocr_model_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=1, column=1, padx=5, pady=5)
+        
+        # 提取模型
+        tk.Label(llm_grid, text="提取模型ID:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=2, column=0, padx=5, pady=5)
+        tk.Entry(llm_grid, textvariable=self.tab7_extract_model_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=2, column=1, padx=5, pady=5)
+        
+        # 4. 提取配置卡片
+        extract_card = self.create_card(scrollable_frame, "提取内容配置")
+        extract_card.pack(fill="x", pady=8)
+        
+        extract_grid = tk.Frame(extract_card, bg=COLORS['bg_primary'])
+        extract_grid.pack(fill="x")
+        
+        # 系统提示词
+        tk.Label(extract_grid, text="系统提示词:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='nw').grid(row=0, column=0, padx=5, pady=5, sticky='n')
+        prompt_text = tk.Text(extract_grid, width=50, height=3, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary'])
+        prompt_text.grid(row=0, column=1, padx=5, pady=5)
+        prompt_text.insert("1.0", self.tab7_system_prompt_var.get())
+        prompt_text.bind("<KeyRelease>", lambda e: self.tab7_system_prompt_var.set(prompt_text.get("1.0", "end-1c")))
+        
+        # 增量表头
+        tk.Label(extract_grid, text="增量表头:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='nw').grid(row=1, column=0, padx=5, pady=5, sticky='n')
+        
+        headers_frame = tk.Frame(extract_grid, bg=COLORS['bg_primary'])
+        headers_frame.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+        
+        for i in range(10):
+            tk.Label(headers_frame, text=f"表头{i+1}:", bg=COLORS['bg_primary'], fg=COLORS['text_secondary'], width=8, anchor='e').grid(row=i//2, column=(i%2)*2, padx=2, pady=2)
+            tk.Entry(headers_frame, textvariable=self.tab7_header_vars[i], width=20, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=i//2, column=(i%2)*2+1, padx=2, pady=2)
+        
+        # 5. 输出配置
+        output_card = self.create_card(scrollable_frame, "输出配置")
+        output_card.pack(fill="x", pady=8)
+        
+        output_grid = tk.Frame(output_card, bg=COLORS['bg_primary'])
+        output_grid.pack(fill="x")
+        
+        tk.Label(output_grid, text="输出目录:", bg=COLORS['bg_primary'], fg=COLORS['text_primary'], width=12, anchor='e').grid(row=0, column=0, padx=5, pady=5)
+        tk.Entry(output_grid, textvariable=self.tab7_output_dir_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(output_grid, text="浏览", command=self.select_output_dir_tab7, bg=COLORS['primary'], fg='white', padx=15).grid(row=0, column=2, padx=5, pady=5)
+        
+        # 6. 操作按钮
+        button_frame = tk.Frame(scrollable_frame, bg=COLORS['bg_primary'])
+        button_frame.pack(fill="x", pady=16)
+        
+        self.tab7_start_btn = self.create_primary_button(button_frame, "开始提取", self.start_extract_task_tab7)
+        self.tab7_start_btn.pack(side="left", padx=10)
+        
+        self.tab7_pause_btn = tk.Button(button_frame, 
+                                      text="⏸ 暂停", 
+                                      command=self.pause_extract_task_tab7,
+                                      bg=COLORS['warning'],
+                                      fg='white',
+                                      font=('微软雅黑', 10, 'bold'),
+                                      relief='flat',
+                                      padx=20,
+                                      pady=8,
+                                      cursor='hand2',
+                                      state="disabled")
+        self.tab7_pause_btn.pack(side="left", padx=10)
+        
+        self.tab7_stop_btn = tk.Button(button_frame, 
+                                      text="■ 停止", 
+                                      command=self.stop_extract_task_tab7,
+                                      bg=COLORS['danger'],
+                                      fg='white',
+                                      font=('微软雅黑', 10, 'bold'),
+                                      relief='flat',
+                                      padx=20,
+                                      pady=8,
+                                      cursor='hand2',
+                                      state="disabled")
+        self.tab7_stop_btn.pack(side="left", padx=10)
+        
+        # 跳过hash检查复选框
+        tk.Checkbutton(button_frame, 
+                      text="强制刷新（跳过缓存）", 
+                      variable=self.tab7_skip_hash_check_var,
+                      bg=COLORS['bg_primary'],
+                      fg=COLORS['text_primary'],
+                      selectcolor=COLORS['input_bg'],
+                      activebackground=COLORS['bg_primary'],
+                      activeforeground=COLORS['text_primary']).pack(side="left", padx=20)
+        
+        # 7. 进度条
+        progress_container = tk.Frame(scrollable_frame, bg=COLORS['bg_secondary'], relief='ridge', bd=1)
+        progress_container.pack(fill="x", pady=8)
+        
+        progress_inner = tk.Frame(progress_container, bg=COLORS['bg_secondary'], padx=16, pady=8)
+        progress_inner.pack(fill="x")
+        
+        tk.Label(progress_inner, 
+                textvariable=self.tab7_status_var,
+                bg=COLORS['bg_secondary'],
+                fg=COLORS['text_primary'],
+                font=('微软雅黑', 9)).pack(anchor="w")
+        
+        self.tab7_progress_bar = ttk.Progressbar(progress_inner, 
+                                               variable=self.tab7_progress_var,
+                                               maximum=100,
+                                               mode='determinate')
+        self.tab7_progress_bar.pack(fill="x", pady=(4, 0))
+        
+        # 布局滚动区域
+        main_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+    
+    def select_excel_tab7(self):
+        """选择Excel文件"""
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Excel文件", "*.xlsx *.xls"), ("所有文件", "*.*")]
+        )
+        if file_path:
+            try:
+                self.tab7_excel_path_var.set(file_path)
+                self.tab7_df = pd.read_excel(file_path)
+                cols = self.tab7_df.columns.tolist()
+                self.tab7_key_column_cb['values'] = cols
+                self.log(f"Tab7 Excel加载成功: {len(self.tab7_df)} 行, {len(cols)} 列")
+            except Exception as e:
+                messagebox.showerror("错误", f"Excel读取失败: {e}")
+                self.tab7_df = None
+    
+    def select_source_dir_tab7(self):
+        """选择源目录"""
+        dir_path = filedialog.askdirectory()
+        if dir_path:
+            self.tab7_source_dir_var.set(dir_path)
+    
+    def select_output_dir_tab7(self):
+        """选择输出目录"""
+        dir_path = filedialog.askdirectory()
+        if dir_path:
+            self.tab7_output_dir_var.set(dir_path)
+    
+    def test_llm_connection_tab7(self):
+        """测试LLM连接"""
+        api_key = self.tab7_api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("警告", "请先输入API Key")
+            return
+        
+        try:
+            client = OpenAI(
+                api_key=api_key,
+                base_url="https://ark.cn-beijing.volces.com/api/v3"
+            )
+            
+            response = client.chat.completions.create(
+                model=self.tab7_extract_model_var.get() or "ep-20241203113451-q8h4w",
+                messages=[{"role": "user", "content": "测试连接"}],
+                max_tokens=10
+            )
+            
+            if response.choices:
+                messagebox.showinfo("成功", "LLM连接测试成功！")
+                self.log("✓ Tab7 LLM连接测试成功")
+            else:
+                messagebox.showerror("失败", "LLM连接失败：无响应")
+        except Exception as e:
+            messagebox.showerror("失败", f"LLM连接失败：{str(e)}")
+            self.log(f"× Tab7 LLM连接失败: {e}")
+    
+    def parse_page_numbers_tab7(self, page_str):
+        """解析页码字符串"""
+        if not page_str.strip():
+            return None
+        
+        page_nums = []
+        parts = page_str.split(',')
+        
+        for part in parts:
+            part = part.strip()
+            if '-' in part:
+                start, end = map(int, part.split('-'))
+                page_nums.extend(range(start, end + 1))
+            else:
+                page_nums.append(int(part))
+        
+        return sorted(list(set(page_nums)))
+    
+    def start_extract_task_tab7(self):
+        """启动提取任务"""
+        # 参数校验
+        if self.tab7_df is None:
+            messagebox.showwarning("配置不全", "请先加载Excel文件")
+            return
+        
+        if not self.tab7_key_column_var.get():
+            messagebox.showwarning("配置不全", "请选择关键列")
+            return
+        
+        if not self.tab7_source_dir_var.get().strip():
+            messagebox.showwarning("配置不全", "请选择源目录")
+            return
+        
+        if not self.tab7_file_pattern_var.get().strip():
+            messagebox.showwarning("配置不全", "请填写文件名模式")
+            return
+        
+        if not self.tab7_api_key_var.get().strip():
+            messagebox.showwarning("配置不全", "请填写API Key")
+            return
+        
+        if not self.tab7_output_dir_var.get().strip():
+            messagebox.showwarning("配置不全", "请选择输出目录")
+            return
+        
+        # 获取增量表头
+        headers = [var.get().strip() for var in self.tab7_header_vars if var.get().strip()]
+        if not headers:
+            messagebox.showwarning("配置不全", "请至少填写一个增量表头")
+            return
+        
+        # 启动线程执行任务
+        thread = threading.Thread(target=self.run_extract_task_tab7, args=(headers,))
+        thread.daemon = True
+        thread.start()
+    
+    def run_extract_task_tab7(self, headers):
+        """执行提取任务"""
+        try:
+            self.update_tab7_ui_state(True)
+            
+            # 初始化变量
+            source_dir = self.tab7_source_dir_var.get().strip()
+            file_pattern = self.tab7_file_pattern_var.get().strip()
+            page_nums = self.parse_page_numbers_tab7(self.tab7_page_numbers_var.get())
+            output_dir = self.tab7_output_dir_var.get().strip()
+            key_column = self.tab7_key_column_var.get()
+            
+            # 创建输出目录
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 初始化LLM客户端
+            client = OpenAI(
+                api_key=self.tab7_api_key_var.get().strip(),
+                base_url="https://ark.cn-beijing.volces.com/api/v3"
+            )
+            
+            # 创建限流器
+            rate_limiter = RateLimiter(rpm=3000, tpm=800000)
+            
+            # 查找匹配的文件
+            self.log("--- 查找匹配文件 ---")
+            all_files = []
+            for root, dirs, files in os.walk(source_dir):
+                for filename in files:
+                    if fnmatch.fnmatch(filename, file_pattern):
+                        if filename.lower().endswith('.pdf'):
+                            all_files.append(os.path.join(root, filename))
+            
+            self.log(f"找到 {len(all_files)} 个匹配的PDF文件")
+            
+            # 准备结果列表
+            success_files = []
+            failed_files = []
+            no_content_files = []
+            
+            # 如果是继续任务，从上次的位置开始
+            start_index = 0
+            if self.tab7_current_index > 0 and not self.tab7_skip_hash_check_var.get():
+                start_index = self.tab7_current_index
+                self.log(f"继续任务，从第 {start_index + 1} 个文件开始")
+            
+            # 处理每个文件
+            for i in range(start_index, len(all_files)):
+                # 检查暂停标志
+                while self.tab7_pause_flag and not self.tab7_stop_flag:
+                    time.sleep(0.1)
+                    
+                if self.tab7_stop_flag:
+                    break
+                
+                file_path = all_files[i]
+                self.tab7_current_index = i + 1
+                
+                self.log(f"\n处理文件 {i+1}/{len(all_files)}: {os.path.basename(file_path)}")
+                self.tab7_status_var.set(f"处理中: {os.path.basename(file_path)}")
+                self.tab7_progress_var.set((i / len(all_files)) * 100)
+                
+                try:
+                    # 计算文件hash
+                    with open(file_path, 'rb') as f:
+                        file_hash = hashlib.sha256(f.read()).hexdigest()
+                    
+                    # 检查数据库缓存
+                    cached_data = None
+                    if not self.tab7_skip_hash_check_var.get():
+                        cached_data = self.db.get_tab7_cache(file_hash)
+                        if cached_data:
+                            self.log(f"  [缓存命中] {os.path.basename(file_path)}")
+                            # 使用缓存数据更新Excel
+                            if cached_data.get('key_value') and cached_data.get('extracted_data'):
+                                self.update_excel_with_extracted_data_tab7(
+                                    cached_data['key_value'], key_column, 
+                                    headers, cached_data['extracted_data']
+                                )
+                                success_files.append(file_path)
+                                self.log(f"  ✓ 使用缓存数据更新成功")
+                            continue
+                    
+                    # 提取PDF文字
+                    text_content = self.extract_pdf_content_tab7(file_path, page_nums)
+                    
+                    if not text_content:
+                        no_content_files.append(file_path)
+                        self.log(f"  × 未提取到文字内容")
+                        continue
+                    
+                    # 查找匹配的关键列值
+                    key_value = self.find_key_value_in_text_tab7(text_content, key_column, self.tab7_df)
+                    
+                    if not key_value:
+                        failed_files.append(file_path)
+                        self.log(f"  × 未找到匹配的关键列值")
+                        continue
+                    
+                    # 使用LLM提取内容（带限流）
+                    extracted_data = self.extract_content_with_llm_tab7(
+                        client, text_content, headers, self.tab7_system_prompt_var.get(),
+                        rate_limiter
+                    )
+                    
+                    if extracted_data:
+                        # 更新Excel数据
+                        self.update_excel_with_extracted_data_tab7(key_value, key_column, headers, extracted_data)
+                        success_files.append(file_path)
+                        
+                        # 保存到缓存
+                        self.db.save_tab7_cache(file_hash, file_path, key_value, extracted_data)
+                        
+                        self.log(f"  ✓ 成功提取并更新数据")
+                    else:
+                        no_content_files.append(file_path)
+                        self.log(f"  × 提取内容为空")
+                        
+                except Exception as e:
+                    failed_files.append(file_path)
+                    self.log(f"  × 处理失败: {e}")
+            
+            # 保存结果文件
+            self.save_results_tab7(success_files, failed_files, no_content_files, output_dir)
+            
+            # 完成提示
+            if not self.tab7_stop_flag:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "完成",
+                    f"提取任务完成！\n\n"
+                    f"成功处理: {len(success_files)} 个文件\n"
+                    f"提取失败: {len(failed_files)} 个文件\n"
+                    f"无内容: {len(no_content_files)} 个文件"
+                ))
+                
+            # 重置状态
+            if not self.tab7_pause_flag:
+                self.tab7_current_index = 0
+            
+        except Exception as e:
+            self.log(f"提取任务错误: {e}")
+            self.root.after(0, lambda: messagebox.showerror("错误", f"任务失败:\n{e}"))
+        finally:
+            self.update_tab7_ui_state(False)
+    
+    def extract_pdf_content_tab7(self, file_path, page_nums):
+        """提取PDF内容"""
+        try:
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            
+            if page_nums is None:
+                page_nums = list(range(1, total_pages + 1))
+            
+            content = ""
+            for page_num in page_nums:
+                if page_num < 1 or page_num > total_pages:
+                    continue
+                
+                page = doc.load_page(page_num - 1)
+                text = page.get_text()
+                
+                if text.strip():
+                    content += f"\n\n=== 第 {page_num} 页 ===\n\n"
+                    # 清理文本：删除多余空格和换行
+                    cleaned_text = ' '.join(text.split())
+                    content += cleaned_text
+            
+            doc.close()
+            return content.strip()
+            
+        except Exception as e:
+            self.log(f"  PDF提取失败: {e}")
+            return None
+    
+    def find_key_value_in_text_tab7(self, text, key_column, df):
+        """在文本中查找关键列值"""
+        for index, row in df.iterrows():
+            key_value = str(row[key_column]).strip()
+            if key_value and key_value in text:
+                return key_value
+        return None
+    
+    def extract_content_with_llm_tab7(self, client, text, headers, system_prompt, rate_limiter=None):
+        """使用LLM提取内容"""
+        try:
+            # 构建提示词
+            headers_str = "、".join([f'"{h}"' for h in headers])
+            user_prompt = f"{system_prompt}\n\n我所需要的数据如下：{headers_str}。\n\n待处理的文本内容如下：\n{text}"
+            
+            # 估算token数
+            estimated_tokens = len(user_prompt) // 2 + 500  # 粗略估算
+            
+            # 使用限流器
+            if rate_limiter:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(rate_limiter.acquire(estimated_tokens))
+                loop.close()
+            
+            # 调用LLM
+            response = client.chat.completions.create(
+                model=self.tab7_extract_model_var.get() or "ep-20241203113451-q8h4w",
+                messages=[
+                    {"role": "system", "content": "你是一个专业的数据提取助手，请从文本中提取指定的数据并以JSON格式返回。"},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=2000
+            )
+            
+            # 解析响应
+            content = response.choices[0].message.content
+            
+            # 获取token使用情况
+            token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            if hasattr(response, 'usage') and response.usage:
+                token_usage = {
+                    "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
+                    "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
+                    "total_tokens": getattr(response.usage, 'total_tokens', 0)
+                }
+                # 记录token使用
+                if self.tab7_task_id:
+                    self.db.log_token_usage(self.tab7_task_id, 'extract', token_usage['total_tokens'])
+                self.log(f"  Token使用: {token_usage['total_tokens']} (输入:{token_usage['prompt_tokens']}, 输出:{token_usage['completion_tokens']})")
+            
+            # 尝试解析JSON
+            import json
+            try:
+                # 查找JSON部分
+                start = content.find('{')
+                end = content.rfind('}') + 1
+                if start != -1 and end != -1:
+                    json_str = content[start:end]
+                    return json.loads(json_str)
+            except:
+                pass
+            
+            return None
+            
+        except Exception as e:
+            self.log(f"  LLM提取失败: {e}")
+            return None
+    
+    def update_excel_with_extracted_data_tab7(self, key_value, key_column, headers, extracted_data):
+        """更新Excel数据"""
+        for index, row in self.tab7_df.iterrows():
+            if str(row[key_column]).strip() == key_value:
+                for header in headers:
+                    if header in extracted_data:
+                        self.tab7_df.at[index, header] = extracted_data[header]
+                break
+    
+    def save_results_tab7(self, success_files, failed_files, no_content_files, output_dir):
+        """保存结果文件"""
+        import csv
+        from datetime import datetime
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 1. 保存更新后的Excel
+        excel_output = os.path.join(output_dir, f"提取结果_{timestamp}.xlsx")
+        self.tab7_df.to_excel(excel_output, index=False)
+        self.log(f"✓ 已保存更新后的Excel: {excel_output}")
+        
+        # 2. 保存失败文件列表
+        failed_output = os.path.join(output_dir, f"提取失败文件_{timestamp}.csv")
+        with open(failed_output, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['文件路径'])
+            for file_path in failed_files:
+                writer.writerow([file_path])
+        if failed_files:
+            self.log(f"✓ 已保存失败文件列表: {failed_output}")
+        
+        # 3. 保存无内容文件列表
+        no_content_output = os.path.join(output_dir, f"无内容文件_{timestamp}.csv")
+        with open(no_content_output, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['文件路径'])
+            for file_path in no_content_files:
+                writer.writerow([file_path])
+        if no_content_files:
+            self.log(f"✓ 已保存无内容文件列表: {no_content_output}")
+    
+    def pause_extract_task_tab7(self):
+        """暂停/继续提取任务"""
+        if self.tab7_pause_flag:
+            # 继续
+            self.tab7_pause_flag = False
+            self.tab7_pause_btn.configure(text="⏸ 暂停")
+            self.log("▶ 继续提取任务")
+        else:
+            # 暂停
+            self.tab7_pause_flag = True
+            self.tab7_pause_btn.configure(text="▶ 继续")
+            self.log("⏸ 暂停提取任务，保存当前进度...")
+            
+            # 保存当前进度
+            if hasattr(self, 'tab7_df') and self.tab7_df is not None:
+                output_dir = self.tab7_output_dir_var.get().strip()
+                if output_dir:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    excel_output = os.path.join(output_dir, f"进度保存_{timestamp}.xlsx")
+                    self.tab7_df.to_excel(excel_output, index=False)
+                    self.log(f"✓ 当前进度已保存: {excel_output}")
+    
+    def stop_extract_task_tab7(self):
+        """停止提取任务"""
+        if self.tab7_is_running:
+            self.tab7_stop_flag = True
+            self.tab7_pause_flag = False
+            self.log("🛑 正在停止提取任务...")
+            self.tab7_stop_btn.configure(state="disabled", text="停止中...")
+    
+    def update_tab7_ui_state(self, is_running):
+        """更新Tab7 UI状态"""
+        self.tab7_is_running = is_running
+        if is_running:
+            self.tab7_start_btn.configure(state="disabled")
+            self.tab7_pause_btn.configure(state="normal")
+            self.tab7_stop_btn.configure(state="normal")
+            self.tab7_stop_flag = False
+            self.tab7_pause_flag = False
+            self.tab7_pause_btn.configure(text="⏸ 暂停")
+            # 创建任务
+            if self.tab7_task_id is None:
+                self.tab7_task_id = self.db.log_task_start('tab7_extract')
+        else:
+            self.tab7_start_btn.configure(state="normal")
+            self.tab7_pause_btn.configure(state="disabled", text="⏸ 暂停")
+            self.tab7_stop_btn.configure(state="disabled", text="■ 停止")
+            self.tab7_status_var.set("就绪")
+            
+            # 结束任务
+            if self.tab7_task_id is not None:
+                # 统计token
+                token_stats = self.db.get_task_token_usage(self.tab7_task_id)
+                self.log(f"--- Token统计 ---")
+                self.log(f"提取模型Token: {token_stats.get('extract', 0)}")
+                self.log(f"总Token使用: {token_stats.get('total', 0)}")
+                
+                # 记录任务结束
+                status = 'completed' if not self.tab7_stop_flag else 'stopped'
+                self.db.log_task_end(
+                    self.tab7_task_id, status,
+                    len(self.tab7_processed_files) if hasattr(self, 'tab7_processed_files') else 0,
+                    len(self.tab7_processed_files) if hasattr(self, 'tab7_processed_files') else 0,
+                    token_stats['total']
+                )
+                self.tab7_task_id = None
+
+    def setup_tab8(self):
+        """设置Tab8: 批量信息提取"""
+        frame = self.tab8
+        frame.configure(bg=COLORS['bg_primary'])
+        
+        # Tab8相关变量
+        self.tab8_is_running = False
+        self.tab8_stop_flag = False
+        self.tab8_pause_flag = False
+        self.tab8_processed_files = []  # 已处理文件列表
+        self.tab8_current_index = 0  # 当前处理索引
+        self.tab8_task_id = None  # 任务ID
+        self.tab8_skip_hash_check_var = tk.BooleanVar(value=False)  # 跳过hash检查
+        self.tab8_enable_ocr_var = tk.BooleanVar(value=True)  # 启用OCR兜底
+        self.tab8_results_df = None  # 结果DataFrame
+        
+        # Tab8变量
+        self.tab8_source_dir_var = tk.StringVar()
+        self.tab8_file_pattern_var = tk.StringVar()
+        self.tab8_page_numbers_var = tk.StringVar()
+        self.tab8_api_key_var = tk.StringVar()
+        self.tab8_extract_model_var = tk.StringVar()
+        self.tab8_system_prompt_var = tk.StringVar(value="请从下列文件中提取出我所需要的文字或数据，以json格式返回。")
+        self.tab8_output_dir_var = tk.StringVar()
+        
+        # 增量表头变量（最多10个）
+        self.tab8_header_vars = [tk.StringVar() for _ in range(10)]
+        
+        # 进度相关
+        self.tab8_progress_var = tk.DoubleVar()
+        self.tab8_status_var = tk.StringVar(value="就绪")
+        
+        # 创建滚动容器
+        main_canvas = tk.Canvas(frame, bg=COLORS['bg_primary'], highlightthickness=0)
+        scrollbar = tk.Scrollbar(frame, orient="vertical", command=main_canvas.yview)
+        scrollable_frame = tk.Frame(main_canvas, bg=COLORS['bg_primary'])
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        )
+        
+        main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        main_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 标题
+        title_label = tk.Label(scrollable_frame, 
+                              text="批量信息提取", 
+                              font=('微软雅黑', 16, 'bold'),
+                              bg=COLORS['bg_primary'], 
+                              fg=COLORS['text_primary'])
+        title_label.pack(pady=(0, 20))
+        
+        # 1. 源目录和文件模式
+        source_frame = tk.LabelFrame(scrollable_frame, text="1. 文件源配置", 
+                                   bg=COLORS['bg_secondary'], fg=COLORS['text_primary'],
+                                   font=('微软雅黑', 10, 'bold'), padx=16, pady=16)
+        source_frame.pack(fill="x", pady=8)
+        
+        # 源目录
+        tk.Label(source_frame, text="源目录:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        tk.Entry(source_frame, textvariable=self.tab8_source_dir_var, width=60, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(source_frame, text="浏览", command=self.select_source_dir_tab8, bg=COLORS['primary'], fg='white', padx=15).grid(row=0, column=2, padx=5, pady=5)
+        
+        # 文件名模式
+        tk.Label(source_frame, text="文件名模式:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        tk.Entry(source_frame, textvariable=self.tab8_file_pattern_var, width=60, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=1, column=1, padx=5, pady=5)
+        tk.Label(source_frame, text="(如: *.pdf, *-合同.pdf)", bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']).grid(row=1, column=2, padx=5, pady=5, sticky="w")
+        
+        # 页码范围
+        tk.Label(source_frame, text="页码范围:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        tk.Entry(source_frame, textvariable=self.tab8_page_numbers_var, width=60, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=2, column=1, padx=5, pady=5)
+        tk.Label(source_frame, text="(留空=全部, 如: 1,2,3 或 1-3)", bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']).grid(row=2, column=2, padx=5, pady=5, sticky="w")
+        
+        # 2. LLM配置
+        llm_frame = tk.LabelFrame(scrollable_frame, text="2. LLM配置", 
+                                 bg=COLORS['bg_secondary'], fg=COLORS['text_primary'],
+                                 font=('微软雅黑', 10, 'bold'), padx=16, pady=16)
+        llm_frame.pack(fill="x", pady=8)
+        
+        # API Key
+        tk.Label(llm_frame, text="API Key:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        tk.Entry(llm_frame, textvariable=self.tab8_api_key_var, width=60, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary'], show="*").grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(llm_frame, text="测试连接", command=self.test_llm_connection_tab8, bg=COLORS['primary'], fg='white', padx=15).grid(row=0, column=2, padx=5, pady=5)
+        
+        # 模型ID
+        tk.Label(llm_frame, text="提取模型ID:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        tk.Entry(llm_frame, textvariable=self.tab8_extract_model_var, width=60, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=1, column=1, padx=5, pady=5)
+        tk.Label(llm_frame, text="(火山引擎模型ID)", bg=COLORS['bg_secondary'], fg=COLORS['text_secondary']).grid(row=1, column=2, padx=5, pady=5, sticky="w")
+        
+        # 3. 提取内容配置
+        extract_frame = tk.LabelFrame(scrollable_frame, text="3. 提取内容配置", 
+                                     bg=COLORS['bg_secondary'], fg=COLORS['text_primary'],
+                                     font=('微软雅黑', 10, 'bold'), padx=16, pady=16)
+        extract_frame.pack(fill="x", pady=8)
+        
+        # 系统提示词
+        tk.Label(extract_frame, text="系统提示词:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=0, column=0, sticky="nw", padx=5, pady=5)
+        system_prompt_text = tk.Text(extract_frame, width=70, height=3, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary'])
+        system_prompt_text.grid(row=0, column=1, padx=5, pady=5)
+        system_prompt_text.insert("1.0", self.tab8_system_prompt_var.get())
+        system_prompt_text.bind("<KeyRelease>", lambda e: self.tab8_system_prompt_var.set(system_prompt_text.get("1.0", "end").strip()))
+        
+        # 增量表头
+        tk.Label(extract_frame, text="提取字段 (最多10个):", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=1, column=0, sticky="nw", padx=5, pady=5)
+        
+        headers_frame = tk.Frame(extract_frame, bg=COLORS['bg_secondary'])
+        headers_frame.grid(row=1, column=1, padx=5, pady=5)
+        
+        for i in range(10):
+            row = i // 2
+            col = i % 2
+            tk.Label(headers_frame, text=f"字段{i+1}:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=row, column=col*2, sticky="w", padx=(0, 5), pady=2)
+            tk.Entry(headers_frame, textvariable=self.tab8_header_vars[i], width=25, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=row, column=col*2+1, padx=(0, 20), pady=2)
+        
+        # 4. 输出配置
+        output_frame = tk.LabelFrame(scrollable_frame, text="4. 输出配置", 
+                                    bg=COLORS['bg_secondary'], fg=COLORS['text_primary'],
+                                    font=('微软雅黑', 10, 'bold'), padx=16, pady=16)
+        output_frame.pack(fill="x", pady=8)
+        
+        output_grid = tk.Frame(output_frame, bg=COLORS['bg_secondary'])
+        output_grid.pack(fill="x")
+        
+        tk.Label(output_grid, text="输出目录:", bg=COLORS['bg_secondary'], fg=COLORS['text_primary']).grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        tk.Entry(output_grid, textvariable=self.tab8_output_dir_var, width=50, bg=COLORS['input_bg'], fg=COLORS['text_primary'], insertbackground=COLORS['text_primary']).grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(output_grid, text="浏览", command=self.select_output_dir_tab8, bg=COLORS['primary'], fg='white', padx=15).grid(row=0, column=2, padx=5, pady=5)
+        
+        # 5. 操作按钮
+        button_frame = tk.Frame(scrollable_frame, bg=COLORS['bg_primary'])
+        button_frame.pack(fill="x", pady=16)
+        
+        self.tab8_start_btn = self.create_primary_button(button_frame, "开始提取", self.start_extract_task_tab8)
+        self.tab8_start_btn.pack(side="left", padx=10)
+        
+        self.tab8_pause_btn = tk.Button(button_frame, 
+                                      text="⏸ 暂停", 
+                                      command=self.pause_extract_task_tab8,
+                                      bg=COLORS['warning'],
+                                      fg='white',
+                                      font=('微软雅黑', 10, 'bold'),
+                                      relief='flat',
+                                      padx=20,
+                                      pady=8,
+                                      cursor='hand2',
+                                      state="disabled")
+        self.tab8_pause_btn.pack(side="left", padx=10)
+        
+        self.tab8_stop_btn = tk.Button(button_frame, 
+                                      text="■ 停止", 
+                                      command=self.stop_extract_task_tab8,
+                                      bg=COLORS['danger'],
+                                      fg='white',
+                                      font=('微软雅黑', 10, 'bold'),
+                                      relief='flat',
+                                      padx=20,
+                                      pady=8,
+                                      cursor='hand2',
+                                      state="disabled")
+        self.tab8_stop_btn.pack(side="left", padx=10)
+        
+        # 跳过hash检查复选框
+        tk.Checkbutton(button_frame, 
+                      text="强制刷新（跳过缓存）", 
+                      variable=self.tab8_skip_hash_check_var,
+                      bg=COLORS['bg_primary'],
+                      fg=COLORS['text_primary'],
+                      selectcolor=COLORS['input_bg'],
+                      activebackground=COLORS['bg_primary'],
+                      activeforeground=COLORS['text_primary']).pack(side="left", padx=10)
+        
+        # OCR选项复选框
+        tk.Checkbutton(button_frame, 
+                      text="启用OCR兜底", 
+                      variable=self.tab8_enable_ocr_var,
+                      bg=COLORS['bg_primary'],
+                      fg=COLORS['text_primary'],
+                      selectcolor=COLORS['input_bg'],
+                      activebackground=COLORS['bg_primary'],
+                      activeforeground=COLORS['text_primary']).pack(side="left", padx=10)
+        
+        # 6. 进度条
+        progress_container = tk.Frame(scrollable_frame, bg=COLORS['bg_secondary'], relief='ridge', bd=1)
+        progress_container.pack(fill="x", pady=8)
+        
+        progress_inner = tk.Frame(progress_container, bg=COLORS['bg_secondary'], padx=16, pady=8)
+        progress_inner.pack(fill="x")
+        
+        tk.Label(progress_inner, 
+                textvariable=self.tab8_status_var,
+                bg=COLORS['bg_secondary'],
+                fg=COLORS['text_primary'],
+                font=('微软雅黑', 10)).pack(side="left", padx=(0, 16))
+        
+        progress_bar = ttk.Progressbar(progress_inner, 
+                                     variable=self.tab8_progress_var,
+                                     mode='determinate',
+                                     length=400)
+        progress_bar.pack(side="left", fill="x", expand=True)
+        
+        # 配置滚动
+        frame.bind("<Enter>", lambda e: main_canvas.bind_all("<MouseWheel>", 
+                                                            lambda event: main_canvas.yview_scroll(int(-1*(event.delta/120)), "units")))
+        frame.bind("<Leave>", lambda e: main_canvas.unbind_all("<MouseWheel>"))
+        
+        scrollbar.pack(side="right", fill="y")
+        main_canvas.pack(side="left", fill="both", expand=True)
+    
+    # Tab8 辅助函数
+    def select_source_dir_tab8(self):
+        """选择源目录"""
+        directory = filedialog.askdirectory(title="选择源目录")
+        if directory:
+            self.tab8_source_dir_var.set(directory)
+    
+    def select_output_dir_tab8(self):
+        """选择输出目录"""
+        directory = filedialog.askdirectory(title="选择输出目录")
+        if directory:
+            self.tab8_output_dir_var.set(directory)
+    
+    def test_llm_connection_tab8(self):
+        """测试LLM连接"""
+        api_key = self.tab8_api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("警告", "请先输入API Key")
+            return
+        
+        try:
+            client = OpenAI(
+                api_key=api_key,
+                base_url="https://ark.cn-beijing.volces.com/api/v3"
+            )
+            
+            response = client.chat.completions.create(
+                model=self.tab8_extract_model_var.get() or "ep-20241203113451-q8h4w",
+                messages=[{"role": "user", "content": "测试连接"}],
+                max_tokens=10
+            )
+            
+            if response.choices:
+                messagebox.showinfo("成功", "LLM连接测试成功！")
+                self.log("✓ Tab8 LLM连接测试成功")
+            else:
+                messagebox.showerror("失败", "LLM连接失败：无响应")
+        except Exception as e:
+            messagebox.showerror("失败", f"LLM连接失败：{str(e)}")
+            self.log(f"× Tab8 LLM连接失败: {e}")
+    
+    def parse_page_numbers_tab8(self, page_str):
+        """解析页码字符串"""
+        if not page_str.strip():
+            return None
+        
+        page_nums = []
+        parts = page_str.split(',')
+        
+        for part in parts:
+            part = part.strip()
+            if '-' in part:
+                start, end = part.split('-')
+                page_nums.extend(range(int(start), int(end) + 1))
+            else:
+                page_nums.append(int(part))
+        
+        return page_nums
+    
+    def start_extract_task_tab8(self):
+        """开始提取任务"""
+        # 参数验证
+        if not self.tab8_source_dir_var.get().strip():
+            messagebox.showwarning("配置不全", "请选择源目录")
+            return
+        
+        if not self.tab8_file_pattern_var.get().strip():
+            messagebox.showwarning("配置不全", "请填写文件名模式")
+            return
+        
+        if not self.tab8_api_key_var.get().strip():
+            messagebox.showwarning("配置不全", "请填写API Key")
+            return
+        
+        if not self.tab8_output_dir_var.get().strip():
+            messagebox.showwarning("配置不全", "请选择输出目录")
+            return
+        
+        # 获取增量表头
+        headers = [var.get().strip() for var in self.tab8_header_vars if var.get().strip()]
+        if not headers:
+            messagebox.showwarning("配置不全", "请至少填写一个提取字段")
+            return
+        
+        # 初始化结果DataFrame
+        import pandas as pd
+        self.tab8_results_df = pd.DataFrame(columns=['文件路径', '文件名'] + headers + ['提取状态', 'Token使用'])
+        
+        # 启动线程执行任务
+        thread = threading.Thread(target=self.run_extract_task_tab8, args=(headers,))
+        thread.daemon = True
+        thread.start()
+    
+    def run_extract_task_tab8(self, headers):
+        """执行提取任务"""
+        try:
+            self.update_tab8_ui_state(True)
+            
+            # 初始化变量
+            source_dir = self.tab8_source_dir_var.get().strip()
+            file_pattern = self.tab8_file_pattern_var.get().strip()
+            page_nums = self.parse_page_numbers_tab8(self.tab8_page_numbers_var.get())
+            output_dir = self.tab8_output_dir_var.get().strip()
+            
+            # 创建输出目录
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 初始化LLM客户端
+            client = OpenAI(
+                api_key=self.tab8_api_key_var.get().strip(),
+                base_url="https://ark.cn-beijing.volces.com/api/v3"
+            )
+            
+            # 创建限流器
+            rate_limiter = RateLimiter(rpm=3000, tpm=800000)
+            
+            # 查找匹配的文件
+            self.log("--- 查找匹配文件 ---")
+            all_files = []
+            for root, dirs, files in os.walk(source_dir):
+                for filename in files:
+                    if fnmatch.fnmatch(filename, file_pattern):
+                        if filename.lower().endswith('.pdf'):
+                            all_files.append(os.path.join(root, filename))
+            
+            self.log(f"找到 {len(all_files)} 个匹配的PDF文件")
+            
+            # 准备结果列表
+            success_files = []
+            failed_files = []
+            no_content_files = []
+            
+            # 如果是继续任务，从上次的位置开始
+            start_index = 0
+            if self.tab8_current_index > 0 and not self.tab8_skip_hash_check_var.get():
+                start_index = self.tab8_current_index
+                self.log(f"继续任务，从第 {start_index + 1} 个文件开始")
+            
+            # 处理每个文件
+            for i in range(start_index, len(all_files)):
+                # 检查暂停标志
+                while self.tab8_pause_flag and not self.tab8_stop_flag:
+                    time.sleep(0.1)
+                    
+                if self.tab8_stop_flag:
+                    break
+                
+                file_path = all_files[i]
+                self.tab8_current_index = i + 1
+                
+                self.log(f"\n处理文件 {i+1}/{len(all_files)}: {os.path.basename(file_path)}")
+                self.tab8_status_var.set(f"处理中: {os.path.basename(file_path)}")
+                self.tab8_progress_var.set((i / len(all_files)) * 100)
+                
+                try:
+                    # 计算文件hash
+                    with open(file_path, 'rb') as f:
+                        file_hash = hashlib.sha256(f.read()).hexdigest()
+                    
+                    # 检查数据库缓存
+                    cached_data = None
+                    if not self.tab8_skip_hash_check_var.get():
+                        cached_data = self.db.get_tab8_cache(file_hash)
+                        if cached_data:
+                            self.log(f"  [缓存命中] {os.path.basename(file_path)}")
+                            # 使用缓存数据
+                            self.add_result_to_df_tab8(file_path, headers, cached_data['extracted_data'], '缓存命中', 0)
+                            success_files.append(file_path)
+                            self.log(f"  ✓ 使用缓存数据")
+                            continue
+                    
+                    # 提取PDF文字
+                    text_content = self.extract_pdf_content_tab8(file_path, page_nums)
+                    
+                    # 检查是否需要OCR兜底
+                    if not text_content or (len(text_content.strip()) < 50 and self.tab8_enable_ocr_var.get()):
+                        self.log(f"  文本内容不足，尝试OCR处理...")
+                        ocr_content = self.ocr_fallback_tab8(file_path, page_nums)
+                        if ocr_content:
+                            text_content = ocr_content
+                            self.log(f"  ✓ OCR提取成功")
+                        else:
+                            self.log(f"  × OCR提取失败")
+                    
+                    if not text_content:
+                        no_content_files.append(file_path)
+                        self.add_result_to_df_tab8(file_path, headers, {}, '无内容', 0)
+                        self.log(f"  × 未提取到文字内容")
+                        continue
+                    
+                    # 使用LLM提取内容（带限流）
+                    extracted_data, token_usage = self.extract_content_with_llm_tab8(
+                        client, text_content, headers, self.tab8_system_prompt_var.get(),
+                        rate_limiter
+                    )
+                    
+                    if extracted_data:
+                        # 添加到结果DataFrame
+                        self.add_result_to_df_tab8(file_path, headers, extracted_data, '成功', token_usage)
+                        success_files.append(file_path)
+                        
+                        # 保存到缓存
+                        self.db.save_tab8_cache(file_hash, file_path, extracted_data)
+                        
+                        self.log(f"  ✓ 成功提取数据")
+                    else:
+                        no_content_files.append(file_path)
+                        self.add_result_to_df_tab8(file_path, headers, {}, '提取失败', token_usage)
+                        self.log(f"  × 提取内容为空")
+                        
+                except Exception as e:
+                    failed_files.append(file_path)
+                    self.add_result_to_df_tab8(file_path, headers, {}, f'处理失败: {str(e)}', 0)
+                    self.log(f"  × 处理失败: {e}")
+            
+            # 保存结果文件
+            self.save_results_tab8(success_files, failed_files, no_content_files, output_dir)
+            
+            # 完成提示
+            if not self.tab8_stop_flag:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "完成",
+                    f"提取任务完成！\n\n"
+                    f"成功处理: {len(success_files)} 个文件\n"
+                    f"提取失败: {len(failed_files)} 个文件\n"
+                    f"无内容: {len(no_content_files)} 个文件"
+                ))
+                
+            # 重置状态
+            if not self.tab8_pause_flag:
+                self.tab8_current_index = 0
+            
+        except Exception as e:
+            self.log(f"提取任务错误: {e}")
+            self.root.after(0, lambda: messagebox.showerror("错误", f"任务失败:\n{e}"))
+        finally:
+            self.update_tab8_ui_state(False)
+    
+    def extract_pdf_content_tab8(self, file_path, page_nums):
+        """提取PDF内容"""
+        try:
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            
+            if page_nums is None:
+                page_nums = list(range(1, total_pages + 1))
+            
+            content = ""
+            for page_num in page_nums:
+                if page_num < 1 or page_num > total_pages:
+                    continue
+                
+                page = doc.load_page(page_num - 1)
+                text = page.get_text()
+                
+                if text.strip():
+                    content += f"\n\n=== 第 {page_num} 页 ===\n\n"
+                    # 清理文本：删除多余空格和换行
+                    cleaned_text = ' '.join(text.split())
+                    content += cleaned_text
+            
+            doc.close()
+            return content.strip()
+            
+        except Exception as e:
+            self.log(f"  PDF提取失败: {e}")
+            return None
+    
+    def ocr_fallback_tab8(self, file_path, page_nums):
+        """OCR兜底处理 - 使用LLM视觉能力"""
+        try:
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            
+            if page_nums is None:
+                page_nums = list(range(1, total_pages + 1))
+            
+            content = ""
+            for page_num in page_nums:
+                if page_num < 1 or page_num > total_pages:
+                    continue
+                
+                page = doc.load_page(page_num - 1)
+                
+                # 将页面转换为图像
+                pix = page.get_pixmap(dpi=200)  # 200 DPI
+                img_data = pix.tobytes("png")
+                
+                # 转换为base64
+                import base64
+                img_base64 = base64.b64encode(img_data).decode('utf-8')
+                
+                # 使用LLM进行OCR
+                ocr_text = self._ocr_with_llm_tab8(img_base64)
+                
+                if ocr_text:
+                    content += f"\n\n=== 第 {page_num} 页 (OCR) ===\n\n"
+                    content += ocr_text.strip()
+                    self.log(f"  第{page_num}页OCR完成")
+            
+            doc.close()
+            return content.strip() if content else None
+            
+        except Exception as e:
+            self.log(f"  OCR处理失败: {e}")
+            return None
+    
+    def _ocr_with_llm_tab8(self, img_base64):
+        """使用LLM进行OCR识别"""
+        try:
+            client = OpenAI(
+                api_key=self.tab8_api_key_var.get().strip(),
+                base_url="https://ark.cn-beijing.volces.com/api/v3"
+            )
+            
+            # 构建消息
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "请识别图片中的所有文字内容，保持原有格式和换行。如果图片中没有文字，请返回空字符串。"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}"
+                            }
+                        }
+                    ]
+                }
+            ]
+            
+            # 调用视觉模型
+            response = client.chat.completions.create(
+                model=self.tab8_extract_model_var.get() or "ep-20241203113451-q8h4w",
+                messages=messages,
+                max_tokens=2000,
+                temperature=0.1
+            )
+            
+            if response.choices and response.choices[0].message.content:
+                # 记录token使用
+                if hasattr(response, 'usage') and response.usage and self.tab8_task_id:
+                    self.db.log_token_usage(self.tab8_task_id, 'ocr', response.usage.total_tokens)
+                
+                return response.choices[0].message.content.strip()
+            
+            return None
+            
+        except Exception as e:
+            self.log(f"    LLM OCR错误: {e}")
+            return None
+    
+    def extract_content_with_llm_tab8(self, client, text, headers, system_prompt, rate_limiter=None):
+        """使用LLM提取内容"""
+        try:
+            # 构建提示词
+            headers_str = "、".join([f'"{h}"' for h in headers])
+            user_prompt = f"{system_prompt}\n\n我所需要的数据如下：{headers_str}。\n\n待处理的文本内容如下：\n{text}"
+            
+            # 估算token数
+            estimated_tokens = len(user_prompt) // 2 + 500  # 粗略估算
+            
+            # 使用限流器
+            if rate_limiter:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(rate_limiter.acquire(estimated_tokens))
+                loop.close()
+            
+            # 调用LLM
+            response = client.chat.completions.create(
+                model=self.tab8_extract_model_var.get() or "ep-20241203113451-q8h4w",
+                messages=[
+                    {"role": "system", "content": "你是一个专业的数据提取助手，请从文本中提取指定的数据并以JSON格式返回。"},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=2000
+            )
+            
+            # 解析响应
+            content = response.choices[0].message.content
+            
+            # 获取token使用情况
+            token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            if hasattr(response, 'usage') and response.usage:
+                token_usage = {
+                    "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
+                    "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
+                    "total_tokens": getattr(response.usage, 'total_tokens', 0)
+                }
+                # 记录token使用
+                if self.tab8_task_id:
+                    self.db.log_token_usage(self.tab8_task_id, 'extract', token_usage['total_tokens'])
+                self.log(f"  Token使用: {token_usage['total_tokens']} (输入:{token_usage['prompt_tokens']}, 输出:{token_usage['completion_tokens']})")
+            
+            # 尝试解析JSON
+            import json
+            try:
+                # 查找JSON部分
+                start = content.find('{')
+                end = content.rfind('}') + 1
+                if start != -1 and end != -1:
+                    json_str = content[start:end]
+                    return json.loads(json_str), token_usage['total_tokens']
+            except:
+                pass
+            
+            return None, token_usage['total_tokens']
+            
+        except Exception as e:
+            self.log(f"  LLM提取失败: {e}")
+            return None, 0
+    
+    def add_result_to_df_tab8(self, file_path, headers, extracted_data, status, token_usage):
+        """添加结果到DataFrame"""
+        import pandas as pd
+        
+        row_data = {
+            '文件路径': file_path,
+            '文件名': os.path.basename(file_path),
+            '提取状态': status,
+            'Token使用': token_usage
+        }
+        
+        # 添加提取的字段数据
+        for header in headers:
+            row_data[header] = extracted_data.get(header, '')
+        
+        # 使用concat而不是append
+        new_row_df = pd.DataFrame([row_data])
+        self.tab8_results_df = pd.concat([self.tab8_results_df, new_row_df], ignore_index=True)
+    
+    def save_results_tab8(self, success_files, failed_files, no_content_files, output_dir):
+        """保存结果文件"""
+        import pandas as pd
+        import csv
+        from datetime import datetime
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 1. 保存提取结果Excel
+        excel_output = os.path.join(output_dir, f"提取结果_{timestamp}.xlsx")
+        self.tab8_results_df.to_excel(excel_output, index=False)
+        self.log(f"✓ 已保存提取结果: {excel_output}")
+        
+        # 2. 保存提取失败文件列表
+        if failed_files:
+            failed_output = os.path.join(output_dir, f"提取失败文件_{timestamp}.csv")
+            with open(failed_output, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['文件路径'])
+                for file_path in failed_files:
+                    writer.writerow([file_path])
+            self.log(f"✓ 已保存失败文件列表: {failed_output}")
+        
+        # 3. 保存无内容文件列表
+        if no_content_files:
+            no_content_output = os.path.join(output_dir, f"无内容文件_{timestamp}.csv")
+            with open(no_content_output, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['文件路径'])
+                for file_path in no_content_files:
+                    writer.writerow([file_path])
+            self.log(f"✓ 已保存无内容文件列表: {no_content_output}")
+    
+    def pause_extract_task_tab8(self):
+        """暂停/继续提取任务"""
+        if self.tab8_pause_flag:
+            # 继续
+            self.tab8_pause_flag = False
+            self.tab8_pause_btn.configure(text="⏸ 暂停")
+            self.log("▶ 继续提取任务")
+        else:
+            # 暂停
+            self.tab8_pause_flag = True
+            self.tab8_pause_btn.configure(text="▶ 继续")
+            self.log("⏸ 暂停提取任务，保存当前进度...")
+            
+            # 保存当前进度
+            if hasattr(self, 'tab8_results_df') and self.tab8_results_df is not None:
+                output_dir = self.tab8_output_dir_var.get().strip()
+                if output_dir:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    excel_output = os.path.join(output_dir, f"进度保存_{timestamp}.xlsx")
+                    self.tab8_results_df.to_excel(excel_output, index=False)
+                    self.log(f"✓ 当前进度已保存: {excel_output}")
+    
+    def stop_extract_task_tab8(self):
+        """停止提取任务"""
+        if self.tab8_is_running:
+            self.tab8_stop_flag = True
+            self.tab8_pause_flag = False
+            self.log("🛑 正在停止提取任务...")
+            self.tab8_stop_btn.configure(state="disabled", text="停止中...")
+    
+    def update_tab8_ui_state(self, is_running):
+        """更新Tab8 UI状态"""
+        self.tab8_is_running = is_running
+        if is_running:
+            self.tab8_start_btn.configure(state="disabled")
+            self.tab8_pause_btn.configure(state="normal")
+            self.tab8_stop_btn.configure(state="normal")
+            self.tab8_stop_flag = False
+            self.tab8_pause_flag = False
+            self.tab8_pause_btn.configure(text="⏸ 暂停")
+            # 创建任务
+            if self.tab8_task_id is None:
+                self.tab8_task_id = self.db.log_task_start('tab8_extract')
+        else:
+            self.tab8_start_btn.configure(state="normal")
+            self.tab8_pause_btn.configure(state="disabled", text="⏸ 暂停")
+            self.tab8_stop_btn.configure(state="disabled", text="■ 停止")
+            self.tab8_status_var.set("就绪")
+            
+            # 结束任务
+            if self.tab8_task_id is not None:
+                # 统计token
+                token_stats = self.db.get_task_token_usage(self.tab8_task_id)
+                self.log(f"--- Token统计 ---")
+                self.log(f"提取模型Token: {token_stats.get('extract', 0)}")
+                self.log(f"OCR Token: {token_stats.get('ocr', 0)}")
+                self.log(f"总Token使用: {token_stats.get('total', 0)}")
+                
+                # 记录任务结束
+                status = 'completed' if not self.tab8_stop_flag else 'stopped'
+                self.db.log_task_end(
+                    self.tab8_task_id, status,
+                    len(self.tab8_processed_files) if hasattr(self, 'tab8_processed_files') else 0,
+                    len(self.tab8_processed_files) if hasattr(self, 'tab8_processed_files') else 0,
+                    token_stats['total']
+                )
+                self.tab8_task_id = None
 
 
 if __name__ == "__main__":
