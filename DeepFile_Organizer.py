@@ -2486,7 +2486,7 @@ class FileToolApp:
         self.root_dirs_list = []  # List of source directories
         
         # 新的变量：目录结构配置
-        self.directory_structure = []  # 存储目录结构 [{level: int, excel_column: str, keywords: []}]
+        self.directory_structure = []  # 存储目录结构 [{level: int, excel_column: str, keywords: [], naming_pattern: str}]
         self.association_column = tk.StringVar()  # 关联数据列
         
         frame = self.tab3
@@ -2679,7 +2679,7 @@ class FileToolApp:
         
         # 目标目录
         dest_row = tk.Frame(settings_card, bg=COLORS['bg_primary'])
-        dest_row.pack(fill="x")
+        dest_row.pack(fill="x", pady=(0, 12))
         
         tk.Label(dest_row, 
                 text="目标目录:",
@@ -2695,6 +2695,7 @@ class FileToolApp:
                 highlightthickness=1,
                 highlightcolor=COLORS['border']).pack(side="left", padx=(12, 8), fill="x", expand=True)
         self.create_secondary_button(dest_row, "浏览...", lambda: self.select_dir(self.dest_root_var)).pack(side="right")
+        
         
         # 执行按钮区域
         action_frame = tk.Frame(scrollable_frame, bg=COLORS['bg_primary'])
@@ -2726,6 +2727,13 @@ class FileToolApp:
             level = level_data['level']
             excel_column = level_data['excel_column']
             keywords = level_data['keywords']
+            naming_pattern = level_data.get('naming_pattern', '')
+            
+            # 显示目录名称，如果有自定义命名模式则显示
+            if naming_pattern:
+                display_name = f"第{level+1}级目录 [{naming_pattern}]"
+            else:
+                display_name = f"第{level+1}级目录"
             
             # 创建目录节点
             if level == 0:
@@ -2735,7 +2743,7 @@ class FileToolApp:
             
             dir_node = self.tree.insert(
                 parent, "end", 
-                text=f"第{level+1}级目录", 
+                text=display_name, 
                 values=(excel_column,),
                 tags=("directory",)
             )
@@ -2786,7 +2794,8 @@ class FileToolApp:
                 level_data = {
                     'level': len(self.directory_structure),
                     'excel_column': selected_col,
-                    'keywords': []
+                    'keywords': [],
+                    'naming_pattern': ''  # 初始为空，使用默认的列值
                 }
                 self.directory_structure.append(level_data)
                 self.update_tree_display()
@@ -2822,7 +2831,8 @@ class FileToolApp:
             # 找到对应的层级索引
             level_index = None
             for i, level_data in enumerate(self.directory_structure):
-                if f"第{i+1}级目录" == item_text:
+                # 支持带命名模式的显示
+                if f"第{i+1}级目录" == item_text or f"第{i+1}级目录 [" in item_text:
                     level_index = i
                     break
             
@@ -2842,7 +2852,8 @@ class FileToolApp:
             # 找到对应的目录层级
             level_index = None
             for i, level_data in enumerate(self.directory_structure):
-                if f"第{i+1}级目录" == parent_text:
+                # 支持带命名模式的显示
+                if f"第{i+1}级目录" == parent_text or f"第{i+1}级目录 [" in parent_text:
                     level_index = i
                     break
             
@@ -2897,7 +2908,8 @@ class FileToolApp:
                     item_text = self.tree.item(item, "text")
                     level_index = None
                     for i, level_data in enumerate(self.directory_structure):
-                        if f"第{i+1}级目录" == item_text:
+                        # 支持带命名模式的显示
+                        if f"第{i+1}级目录" == item_text or f"第{i+1}级目录 [" in item_text:
                             level_index = i
                             break
                     
@@ -2932,42 +2944,69 @@ class FileToolApp:
         item_tags = self.tree.item(item, "tags")
         
         if "directory" in item_tags and self.df_tab3 is not None:
-            # 编辑Excel列
-            current_value = self.tree.item(item, "values")[0]
+            # 找到对应的目录层级
+            item_text = self.tree.item(item, "text")
+            level_index = None
+            for i, level_data in enumerate(self.directory_structure):
+                if f"第{i+1}级目录" == item_text or f"第{i+1}级目录 [" in item_text:
+                    level_index = i
+                    break
+            
+            if level_index is None:
+                return
             
             # 创建居中模态对话框
-            dialog, close_dialog, overlay = self.create_centered_dialog("选择Excel列", 250, 140)
+            dialog, close_dialog, overlay = self.create_centered_dialog("编辑目录层级", 400, 300)
             
             # 内容框架
             content_frame = tk.Frame(dialog, bg=COLORS['bg_tertiary'])
             content_frame.pack(fill="both", expand=True, padx=20, pady=15)
             
+            # Excel列选择
             tk.Label(content_frame, 
                     text="选择Excel列:", 
                     bg=COLORS['bg_tertiary'], 
                     fg=COLORS['text_primary'],
-                    font=('微软雅黑', 10)).pack(pady=(0, 10))
+                    font=('微软雅黑', 10)).pack(pady=(0, 5))
             
-            col_cb = ttk.Combobox(content_frame, state="readonly", width=20)
+            col_cb = ttk.Combobox(content_frame, state="readonly", width=30)
             col_cb['values'] = list(self.df_tab3.columns)
-            col_cb.set(current_value)
-            col_cb.pack(pady=5)
+            col_cb.set(self.directory_structure[level_index]['excel_column'])
+            col_cb.pack(pady=(0, 15))
+            
+            # 命名模式输入
+            tk.Label(content_frame, 
+                    text="文件夹命名模式 (可选):", 
+                    bg=COLORS['bg_tertiary'], 
+                    fg=COLORS['text_primary'],
+                    font=('微软雅黑', 10)).pack(pady=(0, 5))
+            
+            tk.Label(content_frame, 
+                    text="使用 {列名} 引用Excel数据，如: {姓名}_证据材料", 
+                    bg=COLORS['bg_tertiary'], 
+                    fg=COLORS['text_secondary'],
+                    font=('微软雅黑', 9)).pack(pady=(0, 5))
+            
+            pattern_entry = tk.Entry(content_frame, 
+                                   width=40, 
+                                   bg=COLORS['input_bg'], 
+                                   fg=COLORS['text_primary'], 
+                                   insertbackground=COLORS['text_primary'],
+                                   relief='solid',
+                                   highlightthickness=1,
+                                   highlightcolor=COLORS['border'])
+            pattern_entry.pack(pady=5)
+            pattern_entry.insert(0, self.directory_structure[level_index].get('naming_pattern', ''))
             
             def confirm():
                 selected_col = col_cb.get()
+                naming_pattern = pattern_entry.get().strip()
+                
                 if selected_col:
-                    # 找到对应的目录层级
-                    item_text = self.tree.item(item, "text")
-                    level_index = None
-                    for i, level_data in enumerate(self.directory_structure):
-                        if f"第{i+1}级目录" == item_text:
-                            level_index = i
-                            break
-                    
-                    if level_index is not None:
-                        self.directory_structure[level_index]['excel_column'] = selected_col
-                        self.update_tree_display()
-                        close_dialog()
+                    self.directory_structure[level_index]['excel_column'] = selected_col
+                    self.directory_structure[level_index]['naming_pattern'] = naming_pattern
+                    self.update_tree_display()
+                    close_dialog()
             
             tk.Button(content_frame, 
                      text="确定", 
@@ -3073,6 +3112,8 @@ class FileToolApp:
             try:
                 self.excel_file_var.set(path)
                 self.df_tab3 = pd.read_excel(path)
+                # 统一清理列名中的空白字符和BOM
+                self.df_tab3.columns = self.df_tab3.columns.str.strip().str.replace('\ufeff', '', regex=False)
                 
                 # 更新关联数据列下拉框
                 cols = self.df_tab3.columns.tolist()
@@ -3329,6 +3370,8 @@ class FileToolApp:
             try:
                 self.excel_file_var.set(path)
                 self.df_tab3 = pd.read_excel(path)
+                # 统一清理列名中的空白字符和BOM
+                self.df_tab3.columns = self.df_tab3.columns.str.strip().str.replace('\ufeff', '', regex=False)
                 
                 # 更新关联数据列下拉框
                 cols = self.df_tab3.columns.tolist()
@@ -3393,73 +3436,155 @@ class FileToolApp:
             self.log(f"整理失败: {e}")
             messagebox.showerror("错误", f"整理失败: {e}")
 
+    def _clean_dirname(self, name: str) -> str:
+        """清理文件夹名称中的非法字符"""
+        for char in r'[\/:*?"<>|]':
+            name = name.replace(char, "_")
+        return name
+
+    def _resolve_naming_pattern(self, pattern: str, row, df_columns) -> str:
+        """解析命名模式，将 {列名} 替换为实际值"""
+        result = pattern
+        for col in df_columns:
+            placeholder = f'{{{col}}}'
+            if placeholder in result:
+                value = str(row[col]).strip()
+                if value and value != 'nan':
+                    result = result.replace(placeholder, value)
+        return result
+
     def execute_advanced_organize(self, excel_path: str, association_col: str, 
                                  directory_cols: List[str], keywords: List[str],
                                  dest_root: Path, file_mode: str):
-        """执行高级整理逻辑"""
-        # 1. 加载Excel数据
-        df = pd.read_excel(excel_path)
+        """执行高级整理逻辑 - 高性能：索引 + 数据驱动"""
+        # 1. 复用已加载的Excel数据（避免重复读取导致列名不一致）
+        if self.df_tab3 is not None:
+            df = self.df_tab3.copy()
+        else:
+            df = pd.read_excel(excel_path)
+        # 统一清理列名中的空白字符和BOM
+        df.columns = df.columns.str.strip().str.replace('\ufeff', '', regex=False)
+        
+        # 校验关联列是否存在
+        if association_col not in df.columns:
+            raise KeyError(f"关联列 '{association_col}' 不在Excel中，可用列: {list(df.columns)}")
         
         # 2. 收集所有源文件
         all_files = self.collect_all_files(self.root_dirs_list)
         self.log(f"共发现 {len(all_files)} 个原始文件")
         
-        # 3. 文件匹配和分组
+        # 3. 提取所有去重的关联值
+        assoc_values = set()
+        for val in df[association_col].dropna().astype(str).str.strip():
+            if val and val != 'nan':
+                assoc_values.add(val)
+        self.log(f"Excel中有 {len(assoc_values)} 个不重复的关联值")
+        
+        # 4. 一次遍历建立倒排索引: association_value -> [file_path, ...]
+        assoc_to_files: Dict[str, List[Path]] = {v: [] for v in assoc_values}
+        
+        # 收集所有层级的关键字（用于后续索引）
+        all_kw = set()
+        for ld in self.directory_structure:
+            all_kw.update(ld['keywords'])
+        
+        # 同时建立 file -> matched_keywords 索引
+        file_keywords: Dict[Path, set] = {}
+        
+        for f in all_files:
+            fname = f.name
+            # 4a. 关联值匹配：简单子串包含检查
+            matched_assoc = None
+            for v in assoc_values:
+                if v in fname:
+                    matched_assoc = v
+                    break
+            
+            if matched_assoc is None:
+                continue
+            
+            assoc_to_files[matched_assoc].append(f)
+            
+            # 4b. 关键字匹配：一次性检查所有关键字
+            kw_set = set()
+            for kw in all_kw:
+                if kw in fname:
+                    kw_set.add(kw)
+            file_keywords[f] = kw_set
+        
+        matched_total = sum(len(v) for v in assoc_to_files.values())
+        self.log(f"索引构建完成：{matched_total} 个文件匹配到关联值")
+        
+        # 5. 按Excel数据行处理（数据找文件，O(1)查找）
         processed_count = 0
         for _, row in df.iterrows():
-            # 获取关联数据值（用于文件名匹配）
             association_value = str(row[association_col]).strip()
             if not association_value or association_value == 'nan':
                 continue
             
-            # 构建目录路径
-            dir_parts = []
-            for col in directory_cols:
-                value = str(row[col]).strip()
-                if value and value != 'nan':
-                    # 清理文件名非法字符
-                    clean_value = value
-                    for char in r'[\/:*?"<>|]': 
-                        clean_value = clean_value.replace(char, "_")
-                    dir_parts.append(clean_value)
-            
-            if not dir_parts:
+            # O(1) 查找该关联值对应的所有文件
+            candidate_files = assoc_to_files.get(association_value, [])
+            if not candidate_files:
                 continue
             
-            # 创建目标目录
-            target_dir = dest_root
-            for part in dir_parts:
-                target_dir = target_dir / part
-            target_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 4. 匹配并复制文件
-            matched_files = self.match_files_for_association(all_files, association_value, keywords)
-            
-            for keyword, file_path in matched_files.items():
-                if file_path:
-                    dest_file = target_dir / file_path.name
+            # 5.1 按目录层级处理
+            for level_data in self.directory_structure:
+                level = level_data['level']
+                level_keywords = level_data['keywords']
+                
+                if not level_keywords:
+                    continue
+                
+                # 构建目录路径
+                target_dir = dest_root
+                path_ok = True
+                for i in range(level + 1):
+                    ld_i = self.directory_structure[i]
+                    level_pattern = ld_i.get('naming_pattern', '')
                     
-                    # 跳过已存在的文件
-                    if dest_file.exists():
-                        self.log(f"[SKIP] 已存在: {dest_file}")
-                        continue
+                    if level_pattern:
+                        dir_name = self._resolve_naming_pattern(level_pattern, row, df.columns)
+                    else:
+                        level_val = str(row[ld_i['excel_column']]).strip()
+                        if not level_val or level_val == 'nan':
+                            path_ok = False
+                            break
+                        dir_name = level_val
                     
-                    # 执行文件操作
-                    try:
-                        if file_mode == "cut":
-                            shutil.move(str(file_path), str(dest_file))
-                            self.log(f"[MOVE] {file_path.name} -> {target_dir}")
-                        else:
-                            shutil.copy2(str(file_path), str(dest_file))
-                            self.log(f"[COPY] {file_path.name} -> {target_dir}")
-                        processed_count += 1
-                    except Exception as e:
-                        self.log(f"[ERROR] 处理文件失败: {file_path.name} - {e}")
+                    target_dir = target_dir / self._clean_dirname(dir_name)
+                
+                if not path_ok:
+                    continue
+                
+                target_dir.mkdir(parents=True, exist_ok=True)
+                
+                # 5.2 从候选文件中按关键字分组（O(candidates × level_keywords)）
+                for f in candidate_files:
+                    f_kws = file_keywords.get(f, set())
+                    for kw in level_keywords:
+                        if kw not in f_kws:
+                            continue
+                        
+                        dest_file = target_dir / f.name
+                        if dest_file.exists():
+                            self.log(f"[SKIP] 已存在: {dest_file}")
+                            continue
+                        
+                        try:
+                            if file_mode == "cut":
+                                shutil.move(str(f), str(dest_file))
+                                self.log(f"[MOVE] {f.name} -> {target_dir} (L{level+1}, KW:{kw})")
+                            else:
+                                shutil.copy2(str(f), str(dest_file))
+                                self.log(f"[COPY] {f.name} -> {target_dir} (L{level+1}, KW:{kw})")
+                            processed_count += 1
+                        except Exception as e:
+                            self.log(f"[ERROR] {f.name} - {e}")
         
         self.log(f"处理完成，共处理 {processed_count} 个文件")
 
-    def match_files_for_association(self, files: List[Path], association_value: str, keywords: List[str]) -> Dict[str, Optional[Path]]:
-        """为关联值匹配文件，返回 {关键字: 文件路径}"""
+    def match_files_for_association(self, files: List[Path], association_value: str, keywords: List[str]) -> Dict[str, List[Path]]:
+        """为关联值匹配文件，返回 {关键字: [文件路径列表]}"""
         matched_files = {}
         
         for file_path in files:
@@ -3469,14 +3594,13 @@ class FileToolApp:
             
             # 检查关键字匹配
             for keyword in keywords:
-                if keyword in matched_files:
-                    continue  # 已找到该关键字的文件
-                
                 # 使用改进的关键字匹配
                 kw_patterns = [f"*{keyword}*", f"{keyword}*", f"*{keyword}"]
                 for pattern in kw_patterns:
                     if fnmatch.fnmatch(file_path.name, pattern):
-                        matched_files[keyword] = file_path
+                        if keyword not in matched_files:
+                            matched_files[keyword] = []
+                        matched_files[keyword].append(file_path)
                         break
         
         return matched_files
